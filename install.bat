@@ -19,9 +19,11 @@ echo Installing Python dependencies...
 py -m pip install -r "%DAEMON_DIR%requirements.txt" --quiet || pip install -r "%DAEMON_DIR%requirements.txt" --quiet
 
 echo Creating silent launcher...
+REM The VBS launches start-daemon.bat hidden, so autostart uses the same robust
+REM interpreter resolution (real Python, not the Microsoft Store pythonw stub).
 (
 echo Set WshShell = CreateObject^("WScript.Shell"^)
-echo WshShell.Run "pythonw """ ^& Replace^(WScript.ScriptFullName, "run_daemon.vbs", "clawdmeter_daemon.py"^) ^& """ --tray", 0, False
+echo WshShell.Run """" ^& Replace^(WScript.ScriptFullName, "run_daemon.vbs", "start-daemon.bat"^) ^& """", 0, False
 ) > "%VBS_FILE%"
 
 echo Creating startup shortcut...
