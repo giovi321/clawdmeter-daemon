@@ -32,4 +32,4 @@ echo Installation complete. The daemon starts automatically at next login (tray 
 echo   Start it now:     start-daemon.bat
 echo   Run in console:   py clawdmeter_daemon.py --no-tray --serve
 echo   Stop it:          right-click the tray icon ^> Quit
-echo   Uninstall:        delete "%SHORTCUT%"
+echo   Uninstall:        uninstall.bat

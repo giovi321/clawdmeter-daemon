@@ -82,7 +82,10 @@ address from `CLAWDMETER_PUSH_URL` / `SMALLTV_PUSH_URL` / `--push-to`.)
 - **`install.bat`** — install dependencies and register **login autostart**. The
   autostart reads its transport from env vars, so set them once:
   `setx CLAWDMETER_PUSH_URL "smalltv.local"` (push) — otherwise it serves on `:8787`.
-  Uninstall by deleting `…\Startup\ClawdmeterDaemon.lnk`.
+- **`uninstall.bat`** — remove the autostart and stop a running instance. It also
+  clears the **legacy** `SmallTVUsageDaemon` / `ClaudeUsageDaemon` startup shortcuts,
+  since this merged daemon replaces them. (Or just delete the `.lnk` from
+  `shell:startup` by hand.)
 
 > Microsoft-Store `pythonw` stub? Set `CLAWDMETER_PYTHONW` to your real interpreter,
 > e.g. `set CLAWDMETER_PYTHONW=C:\Python314\pythonw.exe`.
