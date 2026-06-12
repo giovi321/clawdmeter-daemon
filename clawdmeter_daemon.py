@@ -743,10 +743,14 @@ def run_with_tray(transports: "Transports") -> None:
 
     def transport_item(name):
         # Radio item: pick how the daemon sends data; switches live + is remembered.
+        # pystray rejects an action callable with >2 params, so bind `name` via a
+        # closure (def), not a default arg, to keep the action at (icon, item).
+        def _select(icon, item):
+            transports.select(name)
         return pystray.MenuItem(
             Transports.LABELS[name],
-            lambda icon, item, n=name: transports.select(n),
-            checked=lambda item, n=name: transports.active == n,
+            _select,
+            checked=lambda item: transports.active == name,
             radio=True,
         )
 
@@ -834,7 +838,11 @@ def main() -> None:
     if args.push_interval is not None:
         cfg["push_interval"] = args.push_interval
 
-    initial = chosen or cfg.get("transport") or "serve"
+    # Initial transport: a CLI flag wins, else the remembered choice, else a sensible
+    # default — push if a target is configured (env/config), otherwise serve.
+    initial = chosen or cfg.get("transport")
+    if not initial:
+        initial = "push" if cfg.get("push_url") else "serve"
     save_config(cfg)
 
     threading.Thread(target=poller_loop, args=(args.interval,), daemon=True).start()
