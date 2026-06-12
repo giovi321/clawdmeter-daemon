@@ -71,7 +71,11 @@ Then restart the daemon from a **new** shell so it inherits the variable.
 
 By default the daemon shows a **system-tray icon** (the mascot): grey while
 waiting, red if you're not logged in, full colour once it's serving data. Hover for
-live `5h % / 7d %`; right-click for **Refresh now** / **Quit**.
+live `5h % / 7d %`. **Right-click to pick the transport** — *Serial (USB)* /
+*HTTP push to device* / *HTTP serve* — which switches **live** and is **remembered**
+(in `~/.clawdmeter-daemon.json`), plus **Refresh now** and **Quit**. So you don't
+need flags after the first run; the tray is the switch. (*HTTP push* uses the
+address from `CLAWDMETER_PUSH_URL` / `SMALLTV_PUSH_URL` / `--push-to`.)
 
 - **`start-daemon.bat [flags]`** — start it now, silently (no console). Pass your
   transport, e.g. `start-daemon.bat --serial` or `start-daemon.bat --push-to smalltv.local`.

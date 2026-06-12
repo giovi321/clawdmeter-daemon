@@ -92,6 +92,35 @@ _CLAUDE_REFRESH_COOLDOWN = 900
 _last_claude_refresh = 0.0
 
 
+# ---- Config persistence ---------------------------------------------------
+# Remembers the transport you pick in the tray, so it survives restarts.
+
+CONFIG_PATH = Path.home() / ".clawdmeter-daemon.json"
+
+
+def load_config() -> dict:
+    cfg = {
+        "transport": None,        # "serial" | "push" | "serve"
+        "push_url": "",
+        "serve_host": DEFAULT_HOST,
+        "serve_port": DEFAULT_PORT,
+        "serial_port": None,      # None => auto-detect
+        "push_interval": DEFAULT_PUSH_INTERVAL,
+    }
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text()))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    except OSError as e:
+        log(f"Could not save config: {e}")
+
+
 # ---- Shared state ---------------------------------------------------------
 
 class State:
@@ -423,18 +452,19 @@ def find_device_port(explicit: str | None) -> str | None:
     return None
 
 
-def serial_loop(explicit_port: str | None) -> None:
+def serial_loop(stop: threading.Event, explicit_port: str | None) -> None:
     """Maintain the USB serial link: write the latest payload when it changes, and
-    let the device request refreshes. Polling is done by poller_loop; we just ship."""
+    let the device request refreshes. Polling is done by poller_loop; we just ship.
+    `stop` is the per-transport event so the tray can switch transports at runtime."""
     import serial
     import serial.tools.list_ports
 
     backoff = 1
-    while not state.stop_event.is_set():
+    while not stop.is_set():
         port = find_device_port(explicit_port)
         if not port:
             state.set_status("Searching for serial device...", port=None)
-            state.stop_event.wait(backoff)
+            stop.wait(backoff)
             backoff = min(backoff * 2, 30)
             continue
         try:
@@ -442,7 +472,7 @@ def serial_loop(explicit_port: str | None) -> None:
         except serial.SerialException as e:
             log(f"Serial open failed: {e}")
             state.set_status(f"Serial error: {e}", port=None)
-            state.stop_event.wait(backoff)
+            stop.wait(backoff)
             backoff = min(backoff * 2, 30)
             continue
 
@@ -462,7 +492,7 @@ def serial_loop(explicit_port: str | None) -> None:
                 pass
 
         try:
-            while not state.stop_event.is_set():
+            while not stop.is_set():
                 now = time.time()
                 if now - last_port_check >= PORT_CHECK_INTERVAL:
                     last_port_check = now
@@ -502,9 +532,9 @@ def serial_loop(explicit_port: str | None) -> None:
                 pass
             with state.lock:
                 state.port = None
-        if not state.stop_event.is_set():
+        if not stop.is_set():
             state.set_status("Serial disconnected - reconnecting...", port=None)
-            state.stop_event.wait(2)
+            stop.wait(2)
 
 
 # ---- Transport: HTTP server (device pulls) --------------------------------
@@ -532,12 +562,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def start_http_server(host: str, port: int) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer((host, port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server
-
-
 # ---- Transport: HTTP push (daemon POSTs to device) ------------------------
 
 def normalize_push_url(v: str) -> str:
@@ -549,11 +573,11 @@ def normalize_push_url(v: str) -> str:
     return v
 
 
-def push_loop(url: str, interval: float) -> None:
+def push_loop(stop: threading.Event, url: str, interval: float) -> None:
     log(f"Pushing usage to {url} every {interval:.0f}s")
     state.push_target = url
     first_ok = True
-    while not state.stop_event.is_set():
+    while not stop.is_set():
         payload = state.get_payload()
         if payload.get("ok"):
             try:
@@ -566,24 +590,145 @@ def push_loop(url: str, interval: float) -> None:
             except httpx.HTTPError as e:
                 log(f"Push failed: {e}")
                 first_ok = True
-        state.stop_event.wait(interval)
+        stop.wait(interval)
+
+
+# ---- Transport supervisor (runtime switch from the tray) ------------------
+
+class Transports:
+    NAMES = ("serial", "push", "serve")
+    LABELS = {
+        "serial": "Serial (USB)",
+        "push":   "HTTP push to device",
+        "serve":  "HTTP serve (device pulls)",
+    }
+
+    def __init__(self, cfg: dict):
+        self.lock = threading.RLock()
+        self.cfg = cfg
+        self.active = None
+        self._stop = None        # per-transport stop event for the running thread
+        self._server = None      # ThreadingHTTPServer while serving
+
+    def select(self, name: str) -> None:
+        if name not in self.NAMES:
+            return
+        with self.lock:
+            if name == self.active:
+                return
+            self._teardown()
+            self.active = name
+            self.cfg["transport"] = name
+            save_config(self.cfg)
+            stop = threading.Event()
+            self._stop = stop
+            if name == "serial":
+                threading.Thread(target=serial_loop,
+                                 args=(stop, self.cfg.get("serial_port")), daemon=True).start()
+            elif name == "push":
+                url = (self.cfg.get("push_url") or "").strip()
+                if not url:
+                    state.set_status("HTTP push: set CLAWDMETER_PUSH_URL")
+                    log("Push selected but no target - set CLAWDMETER_PUSH_URL or --push-to")
+                else:
+                    threading.Thread(
+                        target=push_loop,
+                        args=(stop, normalize_push_url(url),
+                              float(self.cfg.get("push_interval", DEFAULT_PUSH_INTERVAL))),
+                        daemon=True).start()
+            elif name == "serve":
+                host = self.cfg.get("serve_host", DEFAULT_HOST)
+                port = int(self.cfg.get("serve_port", DEFAULT_PORT))
+                try:
+                    self._server = ThreadingHTTPServer((host, port), Handler)
+                except OSError as e:
+                    state.set_status(f"serve error: {e}")
+                    log(f"serve bind failed: {e}")
+                    return
+                state.endpoint = f"http://{host}:{port}/"
+                threading.Thread(target=self._server.serve_forever, daemon=True).start()
+            log(f"Transport -> {name}")
+
+    def _teardown(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+            self._stop = None
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:
+                pass
+            self._server = None
+        state.endpoint = ""
+        state.push_target = ""
+        with state.lock:
+            state.port = None
+        self.active = None
+
+    def shutdown(self) -> None:
+        with self.lock:
+            self._teardown()
 
 
 # ---- System tray ----------------------------------------------------------
 
+# Mascot pose for the tray icon (claudepix idle frame; digits index MASCOT_PALETTE).
+MASCOT_ROWS = [
+    "00000000000000000000",
+    "00000000000000000000",
+    "00000000000000000000",
+    "00000000000000000000",
+    "00000111111111110000",
+    "00000111111111110000",
+    "00000112111112110000",
+    "00011112111112111100",
+    "00011111111111111100",
+    "00011111111111111100",
+    "00010111111111110100",
+    "00000111111111110000",
+    "00000111111111110000",
+    "00000111111111110000",
+    "00000100100010010000",
+    "00000100100010010000",
+    "00000100100010010000",
+    "00000000000000000000",
+    "00000000000000000000",
+    "00000000000000000000",
+]
+MASCOT_PALETTE = [0x0000, 0xCBED, 0x0861, 0, 0, 0, 0, 0, 0, 0]  # RGB565; 1=body, 2=eye
+
+
+def _rgb565(c: int) -> tuple:
+    r, g, b = (c >> 11) & 0x1F, (c >> 5) & 0x3F, c & 0x1F
+    return (r * 255 // 31, g * 255 // 63, b * 255 // 31)
+
+
 def _make_icon_image(status_key: str):
-    from PIL import Image, ImageDraw
-    colours = {"ok": "#d97757", "searching": "#888888", "error": "#cc3333"}
-    fill = colours.get(status_key, colours["searching"])
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse([4, 4, 60, 60], fill=fill)
-    d.ellipse([16, 16, 48, 48], fill=(0, 0, 0, 0))
-    d.rectangle([34, 16, 48, 48], fill=fill)
+    """Render the mascot into a tray icon, tinted by status."""
+    from PIL import Image
+    scale = 4
+    n = len(MASCOT_ROWS)
+    img = Image.new("RGBA", (n * scale, n * scale), (0, 0, 0, 0))
+    px = img.load()
+    for y, row in enumerate(MASCOT_ROWS):
+        for x, ch in enumerate(row):
+            idx = int(ch)
+            if idx == 0:
+                continue
+            r, g, b = _rgb565(MASCOT_PALETTE[idx])
+            if status_key == "searching":             # dim grey while waiting
+                lum = (r * 30 + g * 59 + b * 11) // 100
+                r = g = b = lum
+            elif status_key == "error" and idx == 1:   # redden the body on error
+                r, g, b = 200, 70, 55
+            for dy in range(scale):
+                for dx in range(scale):
+                    px[x * scale + dx, y * scale + dy] = (r, g, b, 255)
     return img
 
 
-def run_with_tray() -> None:
+def run_with_tray(transports: "Transports") -> None:
     import pystray
     icons = {k: _make_icon_image(k) for k in ("ok", "searching", "error")}
 
@@ -593,10 +738,24 @@ def run_with_tray() -> None:
     def on_quit(icon, item):
         state.stop_event.set()
         state.refresh_event.set()
+        transports.shutdown()
         icon.stop()
+
+    def transport_item(name):
+        # Radio item: pick how the daemon sends data; switches live + is remembered.
+        return pystray.MenuItem(
+            Transports.LABELS[name],
+            lambda icon, item, n=name: transports.select(n),
+            checked=lambda item, n=name: transports.active == n,
+            radio=True,
+        )
 
     menu = pystray.Menu(
         pystray.MenuItem(lambda _: state.get_tooltip(), None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        transport_item("serial"),
+        transport_item("push"),
+        transport_item("serve"),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Refresh now", on_refresh),
         pystray.MenuItem("Quit", on_quit),
@@ -638,15 +797,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Deliver Claude usage to a desk device (serial / push / serve).")
     # Transports (any combination; defaults to --serve if none chosen).
     ap.add_argument("--serial", nargs="?", const="auto", default=None,
-                    metavar="PORT", help="write over USB serial; optional COM port (else auto-detect)")
+                    metavar="PORT", help="use USB serial; optional COM port (else auto-detect)")
     ap.add_argument("--no-hid", action="store_true", help="tell the serial device to disable HID keys")
-    ap.add_argument("--push-to", default=os.environ.get("CLAWDMETER_PUSH_URL")
-                    or os.environ.get("SMALLTV_PUSH_URL", ""),
-                    metavar="DEVICE", help="HTTP-push to this device, e.g. 192.168.1.50 or smalltv.local")
-    ap.add_argument("--push-interval", type=float, default=DEFAULT_PUSH_INTERVAL)
-    ap.add_argument("--serve", action="store_true", help="run an HTTP server the device polls")
-    ap.add_argument("--host", default=os.environ.get("CLAWDMETER_HOST", DEFAULT_HOST))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("CLAWDMETER_PORT", DEFAULT_PORT)))
+    ap.add_argument("--push-to", default=None,
+                    metavar="DEVICE", help="use HTTP push to this device, e.g. 192.168.1.50 or smalltv.local")
+    ap.add_argument("--push-interval", type=float, default=None)
+    ap.add_argument("--serve", action="store_true", help="use the HTTP server (device polls)")
+    ap.add_argument("--host", default=None)
+    ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL,
                     help="seconds between Claude API refreshes (default 60)")
     ap.add_argument("--tray", action="store_true", help="show the tray icon (default)")
@@ -655,35 +813,47 @@ def main() -> None:
 
     state.hid_enabled = not args.no_hid
 
-    transports = []
+    # Remembered config; a transport flag (or the tray menu) overrides it.
+    cfg = load_config()
+    if not cfg.get("push_url"):
+        cfg["push_url"] = (os.environ.get("CLAWDMETER_PUSH_URL")
+                           or os.environ.get("SMALLTV_PUSH_URL") or "")
+    chosen = None
     if args.serial is not None:
-        explicit = None if args.serial == "auto" else args.serial
-        threading.Thread(target=serial_loop, args=(explicit,), daemon=True).start()
-        transports.append("serial" + (f" {explicit}" if explicit else " (auto)"))
+        cfg["serial_port"] = None if args.serial == "auto" else args.serial
+        chosen = "serial"
     if args.push_to:
-        push_url = normalize_push_url(args.push_to)
-        threading.Thread(target=push_loop, args=(push_url, args.push_interval), daemon=True).start()
-        transports.append(f"push -> {push_url}")
-    # Default to serving if nothing else was selected.
-    if args.serve or not transports:
-        state.endpoint = f"http://{args.host}:{args.port}/"
-        start_http_server(args.host, args.port)
-        transports.append(f"serve {state.endpoint}")
+        cfg["push_url"] = args.push_to
+        chosen = "push"
+    if args.serve:
+        chosen = "serve"
+    if args.host is not None:
+        cfg["serve_host"] = args.host
+    if args.port is not None:
+        cfg["serve_port"] = args.port
+    if args.push_interval is not None:
+        cfg["push_interval"] = args.push_interval
+
+    initial = chosen or cfg.get("transport") or "serve"
+    save_config(cfg)
 
     threading.Thread(target=poller_loop, args=(args.interval,), daemon=True).start()
-    log("clawdmeter-daemon: " + "  |  ".join(transports))
+    transports = Transports(cfg)
+    transports.select(initial)
+    log(f"clawdmeter-daemon: transport = {initial}  (switch from the tray menu)")
 
     use_tray = not args.no_tray
     if use_tray:
         try:
             import pystray  # noqa: F401
             from PIL import Image  # noqa: F401
-            run_with_tray()
+            run_with_tray(transports)
         except ImportError:
             log("pystray/Pillow not installed - running headless (pip install pystray Pillow)")
             run_console()
     else:
         run_console()
+    transports.shutdown()
     log("Stopped")
 
 
