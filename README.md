@@ -135,6 +135,10 @@ Every transport delivers the same object:
   Inbound -Protocol TCP -LocalPort 8787 -Action Allow`).
 - **Device IP keeps changing.** Push to its mDNS name (e.g. `smalltv.local`) or set
   a DHCP reservation.
+- **Several SmallTVs on one network.** Give each device a unique hostname in its
+  WiFi tab (firmware 2.4.0+ ships a unique default like `smalltv-3fa2`), then push
+  to that exact name so each PC reaches the right one, e.g. `--push-to
+  smalltv-desk.local` on one machine and `--push-to smalltv-shelf.local` on another.
 - **Serial device not found.** Check the cable/driver; pass the port explicitly
   (`--serial COM5`). Find it in Device Manager.
 
