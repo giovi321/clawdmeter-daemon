@@ -12,7 +12,8 @@ Pick one or several; they all share the same poller, token handling and tray ico
 
     pip install -r requirements.txt
     python clawdmeter_daemon.py --serial                 # auto-detect the COM port
-    python clawdmeter_daemon.py --push-to 192.168.1.50    # push to a SmallTV
+    python clawdmeter_daemon.py --push                    # push to every SmallTV it finds (mDNS)
+    python clawdmeter_daemon.py --push-to 192.168.1.50    # push to a specific SmallTV
     python clawdmeter_daemon.py --serve --port 8787       # serve for the device to pull
     python clawdmeter_daemon.py --serial --serve          # several at once
 
@@ -573,23 +574,124 @@ def normalize_push_url(v: str) -> str:
     return v
 
 
-def push_loop(stop: threading.Event, url: str, interval: float) -> None:
-    log(f"Pushing usage to {url} every {interval:.0f}s")
-    state.push_target = url
-    first_ok = True
+def _static_push_urls(cfg: dict) -> list:
+    """Normalize the configured push target(s) into a list of URLs.
+
+    cfg['push_url'] may be a single string (legacy / env var) or a list (from a
+    repeated --push-to). Blank entries and duplicates are dropped.
+    """
+    raw = cfg.get("push_url") or ""
+    items = raw if isinstance(raw, list) else [raw]
+    out = []
+    for it in items:
+        it = (it or "").strip()
+        if it:
+            u = normalize_push_url(it)
+            if u not in out:
+                out.append(u)
+    return out
+
+
+# ---- mDNS discovery: find every SmallTV on the LAN ------------------------
+# smalltv-mod firmware (2.8.0+) advertises a `_clawdmeter._tcp` service whose TXT
+# record carries the push path. Browsing for it lets one daemon push to every
+# device with no hardcoded address, so several SmallTVs stay in sync without a
+# --push-to per device. zeroconf is optional: without it, push still works with
+# explicit --push-to hosts.
+
+class Discovery:
+    SERVICE = "_clawdmeter._tcp.local."
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._urls: dict = {}     # mDNS service name -> push URL
+        self._zc = None
+        self._browser = None
+
+    def start(self) -> bool:
+        try:
+            from zeroconf import Zeroconf, ServiceBrowser
+        except ImportError:
+            log("mDNS discovery needs zeroconf (pip install zeroconf) - discovery off")
+            return False
+        self._zc = Zeroconf()
+        self._browser = ServiceBrowser(self._zc, self.SERVICE, handlers=[self._on_change])
+        log("mDNS discovery on - browsing for SmallTV devices")
+        return True
+
+    def _on_change(self, zeroconf, service_type, name, state_change) -> None:
+        from zeroconf import ServiceStateChange
+        if state_change is ServiceStateChange.Removed:
+            with self._lock:
+                if self._urls.pop(name, None):
+                    log(f"device left: {name}")
+            return
+        # Resolve off the browser thread so a slow lookup can't stall discovery.
+        threading.Thread(target=self._resolve, args=(zeroconf, service_type, name),
+                         daemon=True).start()
+
+    def _resolve(self, zeroconf, service_type, name) -> None:
+        try:
+            info = zeroconf.get_service_info(service_type, name, timeout=2000)
+        except Exception:
+            return
+        if not info:
+            return
+        addrs = info.parsed_addresses() if hasattr(info, "parsed_addresses") else []
+        if not addrs:
+            return
+        path = (info.properties or {}).get(b"path") or b"/api/usage"
+        if isinstance(path, (bytes, bytearray)):
+            path = path.decode(errors="replace")
+        url = f"http://{addrs[0]}:{info.port}{path}"
+        with self._lock:
+            if self._urls.get(name) != url:
+                self._urls[name] = url
+                log(f"device found: {name} -> {url}")
+
+    def urls(self) -> list:
+        with self._lock:
+            return list(self._urls.values())
+
+    def stop(self) -> None:
+        try:
+            if self._zc is not None:
+                self._zc.close()
+        except Exception:
+            pass
+        self._zc = None
+        self._browser = None
+
+
+def push_loop(stop: threading.Event, targets_fn, interval: float) -> None:
+    """POST the latest payload to every current target each interval.
+
+    targets_fn() returns the live list of device push URLs (static --push-to
+    hosts plus anything mDNS discovery has found), so devices coming and going
+    are handled without restarting the loop. A per-URL failure never blocks the
+    others.
+    """
+    log(f"HTTP push every {interval:.0f}s (static targets + mDNS discovery)")
+    ok_urls: set = set()
     while not stop.is_set():
         payload = state.get_payload()
-        if payload.get("ok"):
-            try:
-                r = httpx.post(url, json=payload, timeout=10.0)
-                if r.status_code >= 400:
-                    log(f"Push HTTP {r.status_code}")
-                elif first_ok:
-                    log("Pushing to device OK")
-                    first_ok = False
-            except httpx.HTTPError as e:
-                log(f"Push failed: {e}")
-                first_ok = True
+        urls = targets_fn()
+        state.push_target = ", ".join(urls)
+        if payload.get("ok") and urls:
+            for url in urls:
+                try:
+                    r = httpx.post(url, json=payload, timeout=10.0)
+                    if r.status_code >= 400:
+                        log(f"Push {url} HTTP {r.status_code}")
+                        ok_urls.discard(url)
+                    elif url not in ok_urls:
+                        log(f"Pushing to {url} OK")
+                        ok_urls.add(url)
+                except httpx.HTTPError as e:
+                    log(f"Push {url} failed: {e}")
+                    ok_urls.discard(url)
+        elif payload.get("ok") and not urls:
+            state.set_status("Push: waiting for a device (mDNS)")
         stop.wait(interval)
 
 
@@ -609,6 +711,7 @@ class Transports:
         self.active = None
         self._stop = None        # per-transport stop event for the running thread
         self._server = None      # ThreadingHTTPServer while serving
+        self._discovery = None   # mDNS Discovery while pushing
 
     def select(self, name: str) -> None:
         if name not in self.NAMES:
@@ -626,14 +729,27 @@ class Transports:
                 threading.Thread(target=serial_loop,
                                  args=(stop, self.cfg.get("serial_port")), daemon=True).start()
             elif name == "push":
-                url = (self.cfg.get("push_url") or "").strip()
-                if not url:
-                    state.set_status("HTTP push: set CLAWDMETER_PUSH_URL")
-                    log("Push selected but no target - set CLAWDMETER_PUSH_URL or --push-to")
+                static = _static_push_urls(self.cfg)
+                disc = None
+                if self.cfg.get("discover", True):
+                    disc = Discovery()
+                    if not disc.start():
+                        disc = None
+                self._discovery = disc
+                if not static and disc is None:
+                    state.set_status("HTTP push: no target and no discovery")
+                    log("Push selected but no --push-to host and discovery unavailable")
                 else:
+                    def targets(_static=tuple(static), _disc=disc):
+                        urls = list(_static)
+                        if _disc is not None:
+                            for u in _disc.urls():
+                                if u not in urls:
+                                    urls.append(u)
+                        return urls
                     threading.Thread(
                         target=push_loop,
-                        args=(stop, normalize_push_url(url),
+                        args=(stop, targets,
                               float(self.cfg.get("push_interval", DEFAULT_PUSH_INTERVAL))),
                         daemon=True).start()
             elif name == "serve":
@@ -660,6 +776,9 @@ class Transports:
             except Exception:
                 pass
             self._server = None
+        if self._discovery is not None:
+            self._discovery.stop()
+            self._discovery = None
         state.endpoint = ""
         state.push_target = ""
         with state.lock:
@@ -803,8 +922,12 @@ def main() -> None:
     ap.add_argument("--serial", nargs="?", const="auto", default=None,
                     metavar="PORT", help="use USB serial; optional COM port (else auto-detect)")
     ap.add_argument("--no-hid", action="store_true", help="tell the serial device to disable HID keys")
-    ap.add_argument("--push-to", default=None,
-                    metavar="DEVICE", help="use HTTP push to this device, e.g. 192.168.1.50 or smalltv.local")
+    ap.add_argument("--push", action="store_true",
+                    help="use HTTP push with mDNS auto-discovery of SmallTV devices")
+    ap.add_argument("--push-to", action="append", default=None, metavar="DEVICE",
+                    help="HTTP-push to this device (repeatable); e.g. 192.168.1.50 or smalltv.local")
+    ap.add_argument("--no-discover", action="store_true",
+                    help="disable mDNS auto-discovery for push (only push to --push-to hosts)")
     ap.add_argument("--push-interval", type=float, default=None)
     ap.add_argument("--serve", action="store_true", help="use the HTTP server (device polls)")
     ap.add_argument("--host", default=None)
@@ -826,9 +949,13 @@ def main() -> None:
     if args.serial is not None:
         cfg["serial_port"] = None if args.serial == "auto" else args.serial
         chosen = "serial"
-    if args.push_to:
-        cfg["push_url"] = args.push_to
+    if args.push:
         chosen = "push"
+    if args.push_to:
+        cfg["push_url"] = args.push_to      # list (repeatable)
+        chosen = "push"
+    if args.no_discover:
+        cfg["discover"] = False
     if args.serve:
         chosen = "serve"
     if args.host is not None:
