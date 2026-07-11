@@ -36,7 +36,8 @@ pip install -r requirements.txt
 ```sh
 python clawdmeter_daemon.py --serial                 # USB Clawdmeter (auto-detect COM)
 python clawdmeter_daemon.py --serial COM5            # ...or a specific port
-python clawdmeter_daemon.py --push-to 192.168.1.50   # push to a SmallTV (or smalltv.local)
+python clawdmeter_daemon.py --push                   # push to every SmallTV it finds (mDNS)
+python clawdmeter_daemon.py --push-to 192.168.1.50   # push to a specific SmallTV (or smalltv.local)
 python clawdmeter_daemon.py --serve --port 8787      # serve for the device to pull
 python clawdmeter_daemon.py --serial --serve         # several at once
 python clawdmeter_daemon.py --no-tray --serve        # headless console
@@ -115,7 +116,9 @@ Every transport delivers the same object:
 ```
 --serial [PORT]     USB serial; optional COM port, else auto-detect (VID 0x303A)
 --no-hid            tell the serial device to disable its HID keys
---push-to DEVICE    HTTP-push to a device (IP or hostname); env CLAWDMETER_PUSH_URL
+--push              HTTP-push with mDNS auto-discovery of every SmallTV on the LAN
+--push-to DEVICE    HTTP-push to a device (IP or hostname), repeatable; env CLAWDMETER_PUSH_URL
+--no-discover       disable mDNS discovery for push (only push to --push-to hosts)
 --push-interval N   seconds between pushes (default 20)
 --serve             run the HTTP server (default when no transport is chosen)
 --host / --port     bind address for --serve (default 0.0.0.0:8787)
@@ -135,10 +138,14 @@ Every transport delivers the same object:
   Inbound -Protocol TCP -LocalPort 8787 -Action Allow`).
 - **Device IP keeps changing.** Push to its mDNS name (e.g. `smalltv.local`) or set
   a DHCP reservation.
-- **Several SmallTVs on one network.** Give each device a unique hostname in its
-  WiFi tab (firmware 2.4.0+ ships a unique default like `smalltv-3fa2`), then push
-  to that exact name so each PC reaches the right one, e.g. `--push-to
-  smalltv-desk.local` on one machine and `--push-to smalltv-shelf.local` on another.
+- **Several SmallTVs on one network.** With firmware **2.8.0+** just run `--push`:
+  each device advertises itself over mDNS (`_clawdmeter._tcp`) and the daemon
+  discovers them all and pushes the same usage to every one, no per-device address.
+  Devices that join or drop off are picked up on the next push. Needs `zeroconf`
+  (in `requirements.txt`). For a fixed list, or a network where mDNS doesn't carry,
+  pass `--push-to` one or more times (`--push-to a.local --push-to b.local`); add
+  `--no-discover` to push to only those. On older firmware, push to each device's
+  unique hostname (`smalltv-3fa2.local`) by hand.
 - **Serial device not found.** Check the cable/driver; pass the port explicitly
   (`--serial COM5`). Find it in Device Manager.
 

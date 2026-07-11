@@ -4,3 +4,6 @@ pyserial>=3.5
 # Tray icon (Windows/macOS/Linux). Omit if you only ever run --no-tray.
 pystray>=0.19
 Pillow>=10.0
+# mDNS auto-discovery for --push (find every SmallTV on the LAN). Optional:
+# push still works with explicit --push-to hosts if this isn't installed.
+zeroconf>=0.132
