@@ -150,6 +150,20 @@ def save_config(cfg: dict) -> None:
 
 # ---- Shared state ---------------------------------------------------------
 
+def _push_hosts(target: str) -> list:
+    """Turn the stored push target string into bare hosts for display, e.g.
+    "http://192.168.1.44/api/usage, http://smalltv.local/api/usage"
+    -> ["192.168.1.44", "smalltv.local"]. Keeps the tray text short."""
+    hosts = []
+    for url in (target or "").split(", "):
+        url = url.strip()
+        if not url:
+            continue
+        m = re.match(r"https?://([^/]+)", url)
+        hosts.append(m.group(1) if m else url)
+    return hosts
+
+
 class State:
     def __init__(self):
         self.lock = threading.Lock()
@@ -187,6 +201,8 @@ class State:
             return dict(self.payload), self.version
 
     def get_tooltip(self) -> str:
+        """Full detail for the icon's hover tooltip (multi-line). Push targets are
+        trimmed to hosts and capped so even many devices stay readable."""
         with self.lock:
             lines = [f"clawdmeter — {self.status}"]
             p = self.payload
@@ -195,10 +211,36 @@ class State:
             if self.port:
                 lines.append("serial " + self.port)
             if self.push_target:
-                lines.append("push -> " + self.push_target)
-            if self.endpoint and not self.push_target:
+                hosts = _push_hosts(self.push_target)
+                shown = hosts[:6]
+                line = "push -> " + ", ".join(shown)
+                if len(hosts) > len(shown):
+                    line += f" (+{len(hosts) - len(shown)} more)"
+                lines.append(line)
+            elif self.endpoint:
                 lines.append(self.endpoint)
             return "\n".join(lines)
+
+    def get_menu_header(self) -> str:
+        """Compact one-line summary for the tray menu header. Kept narrow on purpose:
+        a long push-target list would otherwise stretch the whole popover, so we show
+        the first host plus a count and leave the full list to the hover tooltip."""
+        with self.lock:
+            parts = [f"clawdmeter — {self.status}"]
+            p = self.payload
+            if p.get("ok"):
+                parts.append(f"5h {p['s']}%  7d {p['w']}%")
+            if self.port:
+                parts.append("serial " + self.port)
+            if self.push_target:
+                hosts = _push_hosts(self.push_target)
+                if len(hosts) == 1:
+                    parts.append("push -> " + hosts[0])
+                elif hosts:
+                    parts.append(f"push -> {hosts[0]} (+{len(hosts) - 1} more)")
+            elif self.endpoint:
+                parts.append(self.endpoint)
+            return "   ".join(parts)
 
     def get_status_key(self) -> str:
         with self.lock:
@@ -1041,7 +1083,7 @@ def run_with_tray(transports: "Transports") -> None:
         )
 
     menu = pystray.Menu(
-        pystray.MenuItem(lambda _: state.get_tooltip(), None, enabled=False),
+        pystray.MenuItem(lambda _: state.get_menu_header(), None, enabled=False),
         pystray.Menu.SEPARATOR,
         transport_item("serial"),
         transport_item("push"),

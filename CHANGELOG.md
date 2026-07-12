@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.0.2
+
+Keep the tray menu compact when pushing to several devices.
+
+- The menu header no longer lists every full push URL inline (which stretched the
+  popover very wide with multiple targets). It now shows a one-line summary with the
+  first host trimmed to its IP/hostname plus a `(+N more)` count.
+- The full target list moved to the icon's hover tooltip, with hosts trimmed and
+  capped at six plus a `(+N more)`.
+- Also fixes the header running lines together (e.g. `Connected5h 9%`), since it is
+  now a single explicitly-spaced line.
+
 ## v1.0.1
 
 Fix the Windows tray silently starting headless (no icon).
