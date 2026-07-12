@@ -9,6 +9,7 @@ stores on this machine) and delivers your 5h / 7d usage to a desk device by any 
   * serve   — HTTP server the device polls (SmallTV pull mode / anything)
 
 Pick one or several; they all share the same poller, token handling and tray icon.
+Cross-platform: Windows, macOS and Linux (tray + login autostart on each).
 
     pip install -r requirements.txt
     python clawdmeter_daemon.py --serial                 # auto-detect the COM port
@@ -16,6 +17,7 @@ Pick one or several; they all share the same poller, token handling and tray ico
     python clawdmeter_daemon.py --push-to 192.168.1.50    # push to a specific SmallTV
     python clawdmeter_daemon.py --serve --port 8787       # serve for the device to pull
     python clawdmeter_daemon.py --serial --serve          # several at once
+    python clawdmeter_daemon.py --install                 # start at login (per-user, this OS)
 
 Firmware that speaks the contract:
   * Clawdmeter (ESP32-S3): https://github.com/giovi321/clawdmeter-win
@@ -76,8 +78,28 @@ API_BODY = {
 }
 
 
+# A daemon launched windowless (pythonw) or headless has no visible console, so
+# every message also goes to this file — the one place to look when "it didn't
+# start". Kept small by a crude size cap (rotate to .1 past ~1 MB).
+LOG_PATH = Path.home() / ".clawdmeter-daemon.log"
+_LOG_MAX_BYTES = 1_000_000
+_log_lock = threading.Lock()
+
+
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    with _log_lock:
+        try:
+            print(line, flush=True)
+        except (OSError, ValueError):
+            pass    # no usable stdout (pythonw with a detached console)
+        try:
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size > _LOG_MAX_BYTES:
+                LOG_PATH.replace(LOG_PATH.with_name(LOG_PATH.name + ".1"))
+            with LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass    # never let logging take the daemon down
 
 
 # Run a child process without flashing a console window on Windows (important when
@@ -928,6 +950,39 @@ def _run_targets_dialog(initial: str) -> int:
     return 0
 
 
+def tray_backend_available() -> bool:
+    """Whether a system-tray icon can plausibly render on this OS/session.
+
+    Windows and macOS always can (pystray's win32/AppKit backends need no display
+    server negotiation). Linux is the hard case: it needs a running display and a
+    StatusNotifier (AppIndicator) or legacy Xorg backend — and even then GNOME on
+    Wayland shows nothing without the user's AppIndicator extension. When this
+    returns False we run headless instead of failing."""
+    if sys.platform in ("win32", "darwin"):
+        return True
+    if os.environ.get("PYSTRAY_BACKEND") == "dummy":
+        return False
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        try:
+            gi.require_version("AyatanaAppIndicator3", "0.1")
+        except ValueError:
+            gi.require_version("AppIndicator3", "0.1")
+        return True
+    except (ImportError, ValueError):
+        pass
+    if os.environ.get("DISPLAY"):
+        try:
+            import Xlib  # noqa: F401
+            return True
+        except ImportError:
+            pass
+    return False
+
+
 def run_with_tray(transports: "Transports") -> None:
     import pystray
     icons = {k: _make_icon_image(k) for k in ("ok", "searching", "error")}
@@ -957,6 +1012,11 @@ def run_with_tray(transports: "Transports") -> None:
             return
         out = proc.stdout or ""
         if not out.startswith("OK\n"):
+            # returncode 1 == the child had no tkinter (common on Linux: python3-tk).
+            if proc.returncode == 1 and "tkinter" in (proc.stderr or "").lower():
+                log("Can't open the dialog: tkinter is missing. Install it "
+                    "(Linux: python3-tk / python3-tkinter) or set push targets via "
+                    "--push-to / CLAWDMETER_PUSH_URL / the config file.")
             return                            # cancelled / closed / no input
         val = out[3:].strip()
         transports.cfg["push_url"] = val
@@ -1004,6 +1064,17 @@ def run_with_tray(transports: "Transports") -> None:
             icon.title = state.get_tooltip()
             state.stop_event.wait(2)
 
+    if sys.platform == "darwin":
+        # Menu-bar-only agent: drop the Dock icon / Python rocket an unbundled
+        # process would otherwise show. Harmless if pystray already set this.
+        try:
+            from AppKit import (NSApplication,
+                                NSApplicationActivationPolicyAccessory)
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory)
+        except Exception:
+            pass
+
     threading.Thread(target=updater, daemon=True).start()
     icon.run()
     state.stop_event.set()
@@ -1020,6 +1091,201 @@ def run_console() -> None:
     except (ValueError, AttributeError):
         pass
     state.stop_event.wait()
+
+
+# ---- Autostart at login (cross-platform, pure stdlib) ---------------------
+# One --install / --uninstall that registers the tray daemon to start at login,
+# using per-OS mechanisms that need no admin and no extra packages:
+#   Windows  HKCU\...\Run value           (winreg)
+#   macOS    ~/Library/LaunchAgents plist  (launchctl)
+#   Linux    ~/.config/autostart .desktop  (XDG autostart, runs in the GUI session)
+# The command always uses the *current* interpreter (windowless on Windows), so
+# there is never a hardcoded Python path to go stale.
+
+AUTOSTART_NAME = "clawdmeter"               # Windows Run value / Task Manager label
+LAUNCHD_LABEL = "com.giovi321.clawdmeter"   # macOS LaunchAgent Label
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _script_path() -> str:
+    return os.path.abspath(__file__)
+
+
+def _windowless_interpreter() -> str:
+    """The interpreter to register for autostart. On Windows, map python.exe to the
+    pythonw.exe beside it so login start never flashes a console; elsewhere use the
+    running interpreter. Never a hardcoded version path."""
+    exe = Path(sys.executable)
+    if sys.platform != "win32":
+        # Keep the path unresolved: a venv's bin/python is a symlink to the base
+        # interpreter, and Python only activates the venv when launched via that
+        # symlink. realpath() would strip it and autostart would run outside the
+        # venv (missing deps). abspath just guarantees it's absolute.
+        return os.path.abspath(str(exe))
+    name = exe.name.lower()
+    if name.startswith("pythonw"):
+        return str(exe)
+    if name.startswith("python"):
+        cand = exe.with_name("pythonw" + exe.name[len("python"):])
+        if cand.exists():
+            return str(cand)
+    return str(exe)   # no pythonw beside it (rare); accept a possible console flash
+
+
+def _autostart_command_args() -> list:
+    return [_windowless_interpreter(), _script_path(), "--tray"]
+
+
+# --- Windows: HKCU Run key ---
+
+def _win_autostart_install() -> str:
+    import winreg
+    interp, script, *rest = _autostart_command_args()
+    cmd = f'"{interp}" "{script}" ' + " ".join(rest)
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+        winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, cmd.strip())
+    msg = f"Autostart on: HKCU\\...\\Run\\{AUTOSTART_NAME} = {cmd.strip()}"
+    if "windowsapps" in interp.lower():
+        msg += ("\nNote: this uses the Microsoft Store Python; a Store update can change "
+                "its path. If autostart later fails, re-run --install (or use a python.org install).")
+    return msg
+
+
+def _win_autostart_uninstall() -> str:
+    import winreg
+    try:
+        with winreg.OpenKeyEx(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0,
+                              winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, AUTOSTART_NAME)
+        return f"Autostart off: removed HKCU\\...\\Run\\{AUTOSTART_NAME}"
+    except FileNotFoundError:
+        return "Autostart was not set (nothing to remove)"
+
+
+def _win_autostart_status() -> str | None:
+    import winreg
+    try:
+        with winreg.OpenKeyEx(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0,
+                              winreg.KEY_QUERY_VALUE) as k:
+            return winreg.QueryValueEx(k, AUTOSTART_NAME)[0]
+    except FileNotFoundError:
+        return None
+
+
+# --- macOS: LaunchAgent plist ---
+
+def _mac_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+
+
+def _mac_autostart_install() -> str:
+    from xml.sax.saxutils import escape
+    logdir = Path.home() / "Library" / "Logs"
+    args = "".join(f"        <string>{escape(a)}</string>\n"
+                   for a in _autostart_command_args())
+    # No KeepAlive on purpose: RunAtLoad starts it at login, and picking Quit from
+    # the menu bar must make it stay dead (KeepAlive would immediately respawn it).
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n<dict>\n'
+        f'    <key>Label</key><string>{LAUNCHD_LABEL}</string>\n'
+        '    <key>ProgramArguments</key>\n    <array>\n'
+        f'{args}    </array>\n'
+        '    <key>RunAtLoad</key><true/>\n'
+        '    <key>ProcessType</key><string>Interactive</string>\n'
+        f'    <key>StandardOutPath</key><string>{escape(str(logdir / "clawdmeter.out.log"))}</string>\n'
+        f'    <key>StandardErrorPath</key><string>{escape(str(logdir / "clawdmeter.err.log"))}</string>\n'
+        '</dict>\n</plist>\n'
+    )
+    p = _mac_plist_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(plist)
+    # Reload so it also starts now; unload first so re-install is idempotent.
+    _run(["launchctl", "unload", "-w", str(p)], capture_output=True, text=True)
+    _run(["launchctl", "load", "-w", str(p)], capture_output=True, text=True)
+    return f"Autostart on: wrote and loaded LaunchAgent {p}"
+
+
+def _mac_autostart_uninstall() -> str:
+    p = _mac_plist_path()
+    if not p.exists():
+        return "Autostart was not set (nothing to remove)"
+    _run(["launchctl", "unload", "-w", str(p)], capture_output=True, text=True)
+    p.unlink()
+    return f"Autostart off: removed LaunchAgent {p}"
+
+
+def _mac_autostart_status() -> str | None:
+    p = _mac_plist_path()
+    return str(p) if p.exists() else None
+
+
+# --- Linux: XDG autostart .desktop ---
+
+def _linux_desktop_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "autostart" / "clawdmeter-daemon.desktop"
+
+
+def _desktop_exec(args: list) -> str:
+    # .desktop Exec: quote any token containing whitespace; escape embedded quotes.
+    out = []
+    for a in args:
+        if any(c.isspace() for c in a) or '"' in a:
+            out.append('"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"')
+        else:
+            out.append(a)
+    return " ".join(out)
+
+
+def _linux_autostart_install() -> str:
+    content = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Clawdmeter Daemon\n"
+        "Comment=Claude usage meter tray daemon\n"
+        f"Exec={_desktop_exec(_autostart_command_args())}\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "Hidden=false\n"
+        "StartupNotify=false\n"
+    )
+    p = _linux_desktop_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return (f"Autostart on: wrote {p}\n"
+            "It starts at your next graphical login (or run start-daemon.sh now).")
+
+
+def _linux_autostart_uninstall() -> str:
+    p = _linux_desktop_path()
+    if not p.exists():
+        return "Autostart was not set (nothing to remove)"
+    p.unlink()
+    return f"Autostart off: removed {p}"
+
+
+def _linux_autostart_status() -> str | None:
+    p = _linux_desktop_path()
+    return str(p) if p.exists() else None
+
+
+def autostart_install() -> str:
+    return {"win32": _win_autostart_install, "darwin": _mac_autostart_install}.get(
+        sys.platform, _linux_autostart_install)()
+
+
+def autostart_uninstall() -> str:
+    return {"win32": _win_autostart_uninstall, "darwin": _mac_autostart_uninstall}.get(
+        sys.platform, _linux_autostart_uninstall)()
+
+
+def autostart_status() -> str | None:
+    return {"win32": _win_autostart_status, "darwin": _mac_autostart_status}.get(
+        sys.platform, _linux_autostart_status)()
 
 
 # ---- Entry point ----------------------------------------------------------
@@ -1044,7 +1310,26 @@ def main() -> None:
                     help="seconds between Claude API refreshes (default 60)")
     ap.add_argument("--tray", action="store_true", help="show the tray icon (default)")
     ap.add_argument("--no-tray", action="store_true", help="run headless in the console")
+    # Autostart at login (per-user, no admin). Cross-platform.
+    ap.add_argument("--install", action="store_true",
+                    help="register autostart at login (per-user) and exit")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove the autostart entry and exit")
+    ap.add_argument("--autostart-status", action="store_true",
+                    help="print whether autostart is registered and exit")
     args = ap.parse_args()
+
+    # Autostart management runs and exits; it never starts the daemon.
+    if args.install:
+        print(autostart_install())
+        return
+    if args.uninstall:
+        print(autostart_uninstall())
+        return
+    if args.autostart_status:
+        where = autostart_status()
+        print(f"autostart: {where}" if where else "autostart: not registered")
+        return
 
     state.hid_enabled = not args.no_hid
 
@@ -1086,13 +1371,23 @@ def main() -> None:
     log(f"clawdmeter-daemon: transport = {initial}  (switch from the tray menu)")
 
     use_tray = not args.no_tray
+    if use_tray and not tray_backend_available():
+        log("No system-tray backend on this session - running headless. (Linux needs a "
+            "display plus AppIndicator/Xlib; GNOME on Wayland also needs the AppIndicator "
+            "GNOME extension.)")
+        use_tray = False
     if use_tray:
         try:
             import pystray  # noqa: F401
             from PIL import Image  # noqa: F401
-            run_with_tray(transports)
         except ImportError:
             log("pystray/Pillow not installed - running headless (pip install pystray Pillow)")
+            use_tray = False
+    if use_tray:
+        try:
+            run_with_tray(transports)
+        except Exception as e:      # backend init/runtime failure -> don't die silently
+            log(f"Tray failed to start ({e!r}) - running headless")
             run_console()
     else:
         run_console()
