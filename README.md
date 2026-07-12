@@ -28,8 +28,9 @@ Needs Python 3.10+.
 pip install -r requirements.txt
 ```
 
-`httpx` is required; `pyserial` is only needed for `--serial`, and `pystray` +
-`Pillow` only for the tray icon.
+`httpx` is required; `pyserial` is only needed for `--serial`, `pystray` +
+`Pillow` only for the tray icon, and `zeroconf` only for mDNS auto-discovery on
+`--push` (without it, push still works via explicit `--push-to` hosts).
 
 ## Quick start
 
@@ -120,6 +121,7 @@ Every transport delivers the same object:
 --serial [PORT]     USB serial; optional COM port, else auto-detect (VID 0x303A)
 --no-hid            tell the serial device to disable its HID keys
 --push              HTTP-push with mDNS auto-discovery of every SmallTV on the LAN
+                    (mDNS is link-local: won't cross subnets/VLANs, see Troubleshooting)
 --push-to DEVICE    HTTP-push to a device (IP or hostname). Repeatable
                     (--push-to A --push-to B) and/or comma-separated
                     (--push-to "A,B"); env CLAWDMETER_PUSH_URL accepts the same list
