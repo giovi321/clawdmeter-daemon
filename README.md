@@ -74,9 +74,12 @@ By default the daemon shows a **system-tray icon** (the mascot): grey while
 waiting, red if you're not logged in, full colour once it's serving data. Hover for
 live `5h % / 7d %`. **Right-click to pick the transport** — *Serial (USB)* /
 *HTTP push to device* / *HTTP serve* — which switches **live** and is **remembered**
-(in `~/.clawdmeter-daemon.json`), plus **Refresh now** and **Quit**. So you don't
-need flags after the first run; the tray is the switch. (*HTTP push* uses the
-address from `CLAWDMETER_PUSH_URL` / `SMALLTV_PUSH_URL` / `--push-to`.)
+(in `~/.clawdmeter-daemon.json`), plus **Configure push targets…**, **Refresh now**
+and **Quit**. So you don't need flags after the first run; the tray is the switch.
+**Configure push targets…** opens a box to type one or more device IPs/hostnames
+(comma-separated, e.g. `192.168.1.44, 192.168.1.45`); it applies immediately and is
+remembered. Leave it blank to rely on mDNS auto-discovery only. (*HTTP push* also
+seeds its targets from `CLAWDMETER_PUSH_URL` / `SMALLTV_PUSH_URL` / `--push-to`.)
 
 - **`start-daemon.bat [flags]`** — start it now, silently (no console). Pass your
   transport, e.g. `start-daemon.bat --serial` or `start-daemon.bat --push-to smalltv.local`.
@@ -117,7 +120,9 @@ Every transport delivers the same object:
 --serial [PORT]     USB serial; optional COM port, else auto-detect (VID 0x303A)
 --no-hid            tell the serial device to disable its HID keys
 --push              HTTP-push with mDNS auto-discovery of every SmallTV on the LAN
---push-to DEVICE    HTTP-push to a device (IP or hostname), repeatable; env CLAWDMETER_PUSH_URL
+--push-to DEVICE    HTTP-push to a device (IP or hostname). Repeatable
+                    (--push-to A --push-to B) and/or comma-separated
+                    (--push-to "A,B"); env CLAWDMETER_PUSH_URL accepts the same list
 --no-discover       disable mDNS discovery for push (only push to --push-to hosts)
 --push-interval N   seconds between pushes (default 20)
 --serve             run the HTTP server (default when no transport is chosen)
@@ -142,10 +147,21 @@ Every transport delivers the same object:
   each device advertises itself over mDNS (`_clawdmeter._tcp`) and the daemon
   discovers them all and pushes the same usage to every one, no per-device address.
   Devices that join or drop off are picked up on the next push. Needs `zeroconf`
-  (in `requirements.txt`). For a fixed list, or a network where mDNS doesn't carry,
-  pass `--push-to` one or more times (`--push-to a.local --push-to b.local`); add
-  `--no-discover` to push to only those. On older firmware, push to each device's
-  unique hostname (`smalltv-3fa2.local`) by hand.
+  (in `requirements.txt`).
+- **Auto-discovery finds nothing (but the devices are reachable).** mDNS is
+  **link-local** — it does not cross routers/VLANs. If the daemon PC and the SmallTVs
+  are on **different subnets** (e.g. PC on `192.168.2.x`, devices on `192.168.10.x`),
+  discovery sees nothing and `.local` names won't resolve, even though direct IP
+  still routes. Fixes: run the daemon on a machine **on the same subnet** as the
+  devices (then `--push` just works), or enable an **mDNS reflector/repeater** on
+  your router between the VLANs, or skip discovery and **list the device IPs
+  explicitly** — via the tray's *Configure push targets…*, or
+  `--push-to 192.168.10.44 --push-to 192.168.10.45` (or `--push-to "192.168.10.44,192.168.10.45"`).
+  For a fixed IP list, add **DHCP reservations** so the addresses don't drift.
+- **Only some devices update.** You listed one host but have several — add the rest
+  (tray *Configure push targets…* or repeated/comma-separated `--push-to`), or use
+  `--push` if they're all on the daemon's subnet. On older firmware, push to each
+  device's unique hostname (`smalltv-3fa2.local`) by hand.
 - **Serial device not found.** Check the cable/driver; pass the port explicitly
   (`--serial COM5`). Find it in Device Manager.
 

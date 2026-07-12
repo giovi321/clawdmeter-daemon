@@ -577,18 +577,22 @@ def normalize_push_url(v: str) -> str:
 def _static_push_urls(cfg: dict) -> list:
     """Normalize the configured push target(s) into a list of URLs.
 
-    cfg['push_url'] may be a single string (legacy / env var) or a list (from a
-    repeated --push-to). Blank entries and duplicates are dropped.
+    cfg['push_url'] may be a single string or a list (from a repeated --push-to).
+    A string entry can itself hold several hosts separated by commas/whitespace/
+    semicolons, so one CLAWDMETER_PUSH_URL env var or one --push-to can target
+    several devices (e.g. "192.168.1.44, 192.168.1.45"). Blank entries and
+    duplicates are dropped.
     """
     raw = cfg.get("push_url") or ""
     items = raw if isinstance(raw, list) else [raw]
     out = []
-    for it in items:
-        it = (it or "").strip()
-        if it:
-            u = normalize_push_url(it)
-            if u not in out:
-                out.append(u)
+    for entry in items:
+        for it in re.split(r"[,\s;]+", (entry or "").strip()):
+            it = it.strip()
+            if it:
+                u = normalize_push_url(it)
+                if u not in out:
+                    out.append(u)
     return out
 
 
@@ -785,6 +789,16 @@ class Transports:
             state.port = None
         self.active = None
 
+    def reselect(self) -> None:
+        """Re-apply the active transport so a config change (e.g. new push targets)
+        takes effect live. select() no-ops on an unchanged name, so tear down first."""
+        with self.lock:
+            active = self.active
+            if not active:
+                return
+            self._teardown()          # clears self.active so select() will proceed
+            self.select(active)
+
     def shutdown(self) -> None:
         with self.lock:
             self._teardown()
@@ -860,6 +874,38 @@ def run_with_tray(transports: "Transports") -> None:
         transports.shutdown()
         icon.stop()
 
+    def on_edit_targets(icon, item):
+        # Edit the comma-separated push target list (IPs/hostnames) from the tray.
+        # Uses a short-lived Tk dialog in the callback thread; applies live.
+        cur = transports.cfg.get("push_url") or ""
+        if isinstance(cur, list):
+            cur = ", ".join(cur)
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            val = simpledialog.askstring(
+                "clawdmeter - push targets",
+                "SmallTV IPs or hostnames, comma-separated\n"
+                "(e.g. 192.168.1.44, 192.168.1.45).\n"
+                "Leave blank to rely on mDNS auto-discovery only.",
+                initialvalue=cur, parent=root)
+            root.destroy()
+        except Exception as e:
+            log(f"Could not open the push-targets dialog: {e}")
+            return
+        if val is None:
+            return                        # cancelled
+        transports.cfg["push_url"] = val.strip()
+        save_config(transports.cfg)
+        log(f"Push targets set to: {val.strip() or '(discovery only)'}")
+        if transports.active == "push":
+            transports.reselect()         # re-arm push with the new list, live
+        else:
+            transports.select("push")     # switch to push using the new list
+
     def transport_item(name):
         # Radio item: pick how the daemon sends data; switches live + is remembered.
         # pystray rejects an action callable with >2 params, so bind `name` via a
@@ -879,6 +925,7 @@ def run_with_tray(transports: "Transports") -> None:
         transport_item("serial"),
         transport_item("push"),
         transport_item("serve"),
+        pystray.MenuItem("Configure push targets...", on_edit_targets),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Refresh now", on_refresh),
         pystray.MenuItem("Quit", on_quit),
