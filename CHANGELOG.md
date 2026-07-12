@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.0.1
+
+Fix the Windows tray silently starting headless (no icon).
+
+- `install.bat` now creates a self-contained `.venv`, installs the dependencies into
+  it, and registers autostart to use it. `start-daemon.bat` launches that same
+  `.venv` interpreter. Previously the launchers relied on the `py`/`pyw` launcher,
+  which can resolve a different Python than the one the deps were installed into (the
+  Microsoft Store Python installs to a sandboxed location another launch can't
+  import), so `pystray`/`Pillow` failed to import and the daemon fell back to headless
+  with no tray icon.
+- `uninstall.bat` removes the autostart registry value directly, so it no longer
+  depends on a working Python, and points at the `.venv` for cleanup.
+
 ## v1.0.0
 
 First cross-platform release. The daemon now runs with full feature parity on
