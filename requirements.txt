@@ -7,3 +7,11 @@ Pillow>=10.0
 # mDNS auto-discovery for --push (find every SmallTV on the LAN). Optional:
 # push still works with explicit --push-to hosts if this isn't installed.
 zeroconf>=0.132
+# macOS tray backend: pystray drives the menu bar via AppKit (pyobjc).
+# Auto-installed only on macOS thanks to the environment marker.
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+# Linux tray backend is OS packages, not pip (install.sh prints the exact command):
+#   Debian/Ubuntu: python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 python3-tk
+#   Fedora:        python3-gobject gtk3 libayatana-appindicator-gtk3 python3-tkinter
+#   Arch:          python-gobject gtk3 libayatana-appindicator tk
+#   GNOME on Wayland also needs the "AppIndicator and KStatusNotifier Support" extension.

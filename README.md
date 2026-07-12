@@ -22,15 +22,26 @@ This merges the two device-specific daemons into one:
 
 ## Install
 
-Needs Python 3.10+.
+Needs Python 3.10+. Works on Windows, macOS and Linux.
 
 ```sh
 pip install -r requirements.txt
 ```
 
+Or use the wrapper that also registers login autostart: `install.bat` (Windows) /
+`./install.sh` (macOS/Linux). On macOS/Linux `install.sh` creates a self-contained
+`.venv` beside the script (with `--system-site-packages`, so a Linux tray still sees
+the system GTK/AppIndicator bindings) — this sidesteps the "externally-managed
+environment" (PEP 668) block on modern Homebrew/Debian Pythons. If you install deps
+by hand there instead, use a venv or `pip install --user`.
+
 `httpx` is required; `pyserial` is only needed for `--serial`, `pystray` +
 `Pillow` only for the tray icon, and `zeroconf` only for mDNS auto-discovery on
-`--push` (without it, push still works via explicit `--push-to` hosts).
+`--push` (without it, push still works via explicit `--push-to` hosts). On
+**macOS** the tray also needs `pyobjc-framework-Cocoa` (auto-installed by the
+requirements marker). On **Linux** the tray needs the AppIndicator + GTK system
+packages and `python3-tk` for the push-targets dialog — `install.sh` prints the
+exact command for your distro; without them the daemon runs headless.
 
 ## Quick start
 
@@ -69,31 +80,62 @@ claude setup-token        # subscription required; prints a token (sk-ant-oat…
 
 Then restart the daemon from a **new** shell so it inherits the variable.
 
-## Windows tray + autostart
+## Tray icon + autostart (Windows, macOS, Linux)
 
-By default the daemon shows a **system-tray icon** (the mascot): grey while
+By default the daemon shows a **tray / menu-bar icon** (the mascot): grey while
 waiting, red if you're not logged in, full colour once it's serving data. Hover for
-live `5h % / 7d %`. **Right-click to pick the transport** — *Serial (USB)* /
-*HTTP push to device* / *HTTP serve* — which switches **live** and is **remembered**
-(in `~/.clawdmeter-daemon.json`), plus **Configure push targets…**, **Refresh now**
-and **Quit**. So you don't need flags after the first run; the tray is the switch.
-**Configure push targets…** opens a box to type one or more device IPs/hostnames
-(comma-separated, e.g. `192.168.1.44, 192.168.1.45`); it applies immediately and is
-remembered. Leave it blank to rely on mDNS auto-discovery only. (*HTTP push* also
-seeds its targets from `CLAWDMETER_PUSH_URL` / `SMALLTV_PUSH_URL` / `--push-to`.)
+live `5h % / 7d %`. **Right-click (macOS: click) to pick the transport** — *Serial
+(USB)* / *HTTP push to device* / *HTTP serve* — which switches **live** and is
+**remembered** (in `~/.clawdmeter-daemon.json`), plus **Configure push targets…**,
+**Refresh now** and **Quit**. So you don't need flags after the first run; the tray
+is the switch. **Configure push targets…** opens a box to type one or more device
+IPs/hostnames (comma-separated, e.g. `192.168.1.44, 192.168.1.45`); it applies
+immediately and is remembered. Leave it blank to rely on mDNS auto-discovery only.
+(*HTTP push* also seeds its targets from `CLAWDMETER_PUSH_URL` / `SMALLTV_PUSH_URL`
+/ `--push-to`.)
 
-- **`start-daemon.bat [flags]`** — start it now, silently (no console). Pass your
-  transport, e.g. `start-daemon.bat --serial` or `start-daemon.bat --push-to smalltv.local`.
-- **`install.bat`** — install dependencies and register **login autostart**. The
-  autostart reads its transport from env vars, so set them once:
-  `setx CLAWDMETER_PUSH_URL "smalltv.local"` (push) — otherwise it serves on `:8787`.
-- **`uninstall.bat`** — remove the autostart and stop a running instance. It also
-  clears the **legacy** `SmallTVUsageDaemon` / `ClaudeUsageDaemon` startup shortcuts,
-  since this merged daemon replaces them. (Or just delete the `.lnk` from
-  `shell:startup` by hand.)
+### Autostart at login
 
-> Microsoft-Store `pythonw` stub? Set `CLAWDMETER_PYTHONW` to your real interpreter,
-> e.g. `set CLAWDMETER_PYTHONW=C:\Python314\pythonw.exe`.
+`--install` registers the tray daemon to start at login, per-user and without admin,
+using each OS's native mechanism — no hardcoded Python path (it registers the
+interpreter you run it with):
+
+| OS | Mechanism | Where |
+|----|-----------|-------|
+| Windows | `HKCU\…\Run` value (windowless `pythonw`) | Task Manager → Startup |
+| macOS | LaunchAgent | `~/Library/LaunchAgents/com.giovi321.clawdmeter.plist` |
+| Linux | XDG autostart `.desktop` (GUI session) | `~/.config/autostart/clawdmeter-daemon.desktop` |
+
+```sh
+python clawdmeter_daemon.py --install            # register autostart at login
+python clawdmeter_daemon.py --uninstall          # remove it
+python clawdmeter_daemon.py --autostart-status   # show what's registered
+```
+
+The autostart command is just `--tray`; the transport comes from the remembered
+config and the env vars above, so autostart needs no edits — set them once (e.g.
+`CLAWDMETER_PUSH_URL=smalltv.local` for push, otherwise it serves on `:8787`).
+
+Convenience scripts wrap dependency install + `--install`:
+
+- **Windows** — `install.bat` (deps + autostart), `start-daemon.bat [flags]` (start
+  now, silent, via the windowless `pyw` launcher), `uninstall.bat` (remove autostart,
+  stop the process, and clear the **legacy** `SmallTVUsageDaemon` / `ClaudeUsageDaemon`
+  shortcuts this merged daemon replaced).
+- **macOS / Linux** — `./install.sh`, `./start-daemon.sh [flags]`, `./uninstall.sh`
+  (set `PYTHON=/path/to/python3` to force an interpreter).
+
+> Windows Microsoft-Store `pythonw` stub, or a non-default interpreter? Set
+> `CLAWDMETER_PYTHONW` before `start-daemon.bat`, e.g.
+> `set CLAWDMETER_PYTHONW=C:\Python314\pythonw.exe`.
+
+> The tray icon starts in the Windows 11 `⌃` overflow area — drag it onto the
+> taskbar to pin it. On **GNOME/Wayland** there is no tray at all without the
+> *AppIndicator and KStatusNotifier Support* extension; without a usable tray backend
+> the daemon logs a note and runs headless (it keeps working, just no icon).
+
+Anything the daemon logs also goes to **`~/.clawdmeter-daemon.log`** — the place to
+look if a windowless/headless launch seems to do nothing.
 
 ## The payload contract
 
@@ -131,10 +173,20 @@ Every transport delivers the same object:
 --host / --port     bind address for --serve (default 0.0.0.0:8787)
 --interval N        seconds between Claude API refreshes (default 60)
 --no-tray           run headless in the console
+--install           register autostart at login (per-user) and exit
+--uninstall         remove the autostart entry and exit
+--autostart-status  print whether autostart is registered and exit
 ```
 
 ## Troubleshooting
 
+- **No tray icon appears.** First check `~/.clawdmeter-daemon.log` — if it shows the
+  daemon polling, it's running and the icon is just hidden or unsupported. **Windows
+  11:** the icon starts in the `⌃` overflow flyout; drag it onto the taskbar. **Linux
+  (GNOME/Wayland):** there is no tray without the *AppIndicator and KStatusNotifier
+  Support* extension, and the icon needs the AppIndicator/GTK packages (see Install);
+  without a backend the daemon logs a note and runs headless. **macOS:** it's a
+  menu-bar icon (no Dock icon by design).
 - **Tray says "Token expired - run: claude setup-token".** Your on-disk credentials
   expired and can't be renewed headlessly. Use a long-lived token (see
   [Authentication](#authentication-the-durable-way)).
