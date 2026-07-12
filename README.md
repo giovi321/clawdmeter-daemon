@@ -28,12 +28,19 @@ Needs Python 3.10+. Works on Windows, macOS and Linux.
 pip install -r requirements.txt
 ```
 
-Or use the wrapper that also registers login autostart: `install.bat` (Windows) /
-`./install.sh` (macOS/Linux). On macOS/Linux `install.sh` creates a self-contained
-`.venv` beside the script (with `--system-site-packages`, so a Linux tray still sees
-the system GTK/AppIndicator bindings) — this sidesteps the "externally-managed
-environment" (PEP 668) block on modern Homebrew/Debian Pythons. If you install deps
-by hand there instead, use a venv or `pip install --user`.
+Recommended: use the wrapper that installs deps and registers login autostart in one
+step: `install.bat` (Windows) / `./install.sh` (macOS/Linux). Both create a
+self-contained `.venv` beside the script and register autostart to use it, so the
+daemon always starts with its dependencies. This matters because the interpreter a
+launcher resolves at start time is not always the one you installed deps into — on
+Windows the Microsoft Store Python installs packages to a sandboxed location another
+launch can't import, which silently drops the tray to headless; on modern
+Homebrew/Debian the system Python refuses a plain `pip install` (PEP 668). The
+macOS/Linux venv uses `--system-site-packages` so a Linux tray still sees the system
+GTK/AppIndicator bindings.
+
+A manual `pip install -r requirements.txt` into your own environment works too, as
+long as you launch the daemon with that same interpreter.
 
 `httpx` is required; `pyserial` is only needed for `--serial`, `pystray` +
 `Pillow` only for the tray icon, and `zeroconf` only for mDNS auto-discovery on
@@ -118,10 +125,10 @@ config and the env vars above, so autostart needs no edits — set them once (e.
 
 Convenience scripts wrap dependency install + `--install`:
 
-- **Windows** — `install.bat` (deps + autostart), `start-daemon.bat [flags]` (start
-  now, silent, via the windowless `pyw` launcher), `uninstall.bat` (remove autostart,
-  stop the process, and clear the **legacy** `SmallTVUsageDaemon` / `ClaudeUsageDaemon`
-  shortcuts this merged daemon replaced).
+- **Windows** — `install.bat` (creates `.venv`, installs deps, registers autostart),
+  `start-daemon.bat [flags]` (start now, silent, using the `.venv` interpreter),
+  `uninstall.bat` (remove autostart, stop the process, and clear the **legacy**
+  `SmallTVUsageDaemon` / `ClaudeUsageDaemon` shortcuts this merged daemon replaced).
 - **macOS / Linux** — `./install.sh`, `./start-daemon.sh [flags]`, `./uninstall.sh`
   (set `PYTHON=/path/to/python3` to force an interpreter).
 
@@ -180,13 +187,17 @@ Every transport delivers the same object:
 
 ## Troubleshooting
 
-- **No tray icon appears.** First check `~/.clawdmeter-daemon.log` — if it shows the
-  daemon polling, it's running and the icon is just hidden or unsupported. **Windows
-  11:** the icon starts in the `⌃` overflow flyout; drag it onto the taskbar. **Linux
-  (GNOME/Wayland):** there is no tray without the *AppIndicator and KStatusNotifier
-  Support* extension, and the icon needs the AppIndicator/GTK packages (see Install);
-  without a backend the daemon logs a note and runs headless. **macOS:** it's a
-  menu-bar icon (no Dock icon by design).
+- **No tray icon appears.** First check `~/.clawdmeter-daemon.log`. If it says
+  `pystray/Pillow not installed - running headless`, the daemon is running under a
+  Python that lacks the tray deps (a launcher resolved a different interpreter than
+  you installed into — common with the Microsoft Store Python). Fix: run `install.bat`
+  / `./install.sh`, which pin a `.venv`, or set `CLAWDMETER_PYTHONW` to a Python that
+  has `pystray` + `Pillow`. If the log instead shows the daemon polling, it's running
+  and the icon is just hidden or unsupported. **Windows 11:** the icon starts in the
+  `⌃` overflow flyout; drag it onto the taskbar. **Linux (GNOME/Wayland):** there is no
+  tray without the *AppIndicator and KStatusNotifier Support* extension, and the icon
+  needs the AppIndicator/GTK packages (see Install); without a backend the daemon logs
+  a note and runs headless. **macOS:** it's a menu-bar icon (no Dock icon by design).
 - **Tray says "Token expired - run: claude setup-token".** Your on-disk credentials
   expired and can't be renewed headlessly. Use a long-lived token (see
   [Authentication](#authentication-the-durable-way)).
