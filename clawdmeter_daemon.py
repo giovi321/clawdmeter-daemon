@@ -47,6 +47,10 @@ DEFAULT_PUSH_INTERVAL = 20     # seconds between HTTP pushes to the device
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8787
 
+# Internal argv flag: re-invoke ourselves to show the push-targets input dialog in
+# its own process (so Tk runs on a real main thread and accepts keyboard input).
+DIALOG_FLAG = "--_targets_dialog"
+
 # Serial auto-detect (the Clawdmeter ESP32-S3 enumerates as Espressif CDC).
 ESPRESSIF_VID = 0x303A
 DEVICE_PID = 0x1001
@@ -861,6 +865,69 @@ def _make_icon_image(status_key: str):
     return img
 
 
+def _run_targets_dialog(initial: str) -> int:
+    """Standalone push-targets input dialog (its own process/main thread, so the
+    entry accepts typing). Prints the entered value as 'OK\\n<value>' to stdout;
+    Cancel/close prints nothing. Run via the DIALOG_FLAG re-invocation."""
+    try:
+        import tkinter as tk
+    except Exception as e:
+        sys.stderr.write(f"tkinter unavailable: {e}\n")
+        return 1
+
+    result = {"val": None}
+    root = tk.Tk()
+    root.title("clawdmeter - push targets")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    tk.Label(
+        root, justify="left",
+        text=("SmallTV IPs or hostnames, comma-separated:\n"
+              "e.g.   192.168.1.44, 192.168.1.45\n"
+              "Leave blank to use mDNS auto-discovery only."),
+    ).pack(padx=16, pady=(16, 8), anchor="w")
+
+    var = tk.StringVar(value=initial)
+    entry = tk.Entry(root, textvariable=var, width=46)
+    entry.pack(padx=16, pady=(0, 10), fill="x")
+
+    def _ok():
+        result["val"] = var.get()
+        root.destroy()
+
+    def _cancel():
+        result["val"] = None
+        root.destroy()
+
+    bar = tk.Frame(root)
+    bar.pack(padx=16, pady=(0, 16), anchor="e")
+    tk.Button(bar, text="Save", width=10, command=_ok).pack(side="right", padx=(8, 0))
+    tk.Button(bar, text="Cancel", width=10, command=_cancel).pack(side="right")
+
+    entry.bind("<Return>", lambda e: _ok())
+    root.bind("<Escape>", lambda e: _cancel())
+    root.protocol("WM_DELETE_WINDOW", _cancel)
+
+    root.update_idletasks()
+    try:
+        root.eval("tk::PlaceWindow . center")
+    except Exception:
+        pass
+    root.lift()
+    entry.focus_force()
+    entry.icursor("end")
+    entry.select_range(0, "end")
+    # Some window managers only grant focus a beat after the window maps.
+    root.after(120, lambda: (root.focus_force(), entry.focus_force()))
+    root.mainloop()
+
+    if result["val"] is not None:
+        sys.stdout.write("OK\n" + result["val"])
+        sys.stdout.flush()
+    return 0
+
+
 def run_with_tray(transports: "Transports") -> None:
     import pystray
     icons = {k: _make_icon_image(k) for k in ("ok", "searching", "error")}
@@ -876,35 +943,29 @@ def run_with_tray(transports: "Transports") -> None:
 
     def on_edit_targets(icon, item):
         # Edit the comma-separated push target list (IPs/hostnames) from the tray.
-        # Uses a short-lived Tk dialog in the callback thread; applies live.
+        # The dialog runs in a SEPARATE process so Tk owns its own main thread and
+        # event loop — a Tk window created on pystray's callback thread renders but
+        # can't take keyboard input. The entered value comes back over stdout.
         cur = transports.cfg.get("push_url") or ""
         if isinstance(cur, list):
             cur = ", ".join(cur)
         try:
-            import tkinter as tk
-            from tkinter import simpledialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            val = simpledialog.askstring(
-                "clawdmeter - push targets",
-                "SmallTV IPs or hostnames, comma-separated\n"
-                "(e.g. 192.168.1.44, 192.168.1.45).\n"
-                "Leave blank to rely on mDNS auto-discovery only.",
-                initialvalue=cur, parent=root)
-            root.destroy()
+            proc = _run([sys.executable, os.path.abspath(__file__), DIALOG_FLAG, cur],
+                        capture_output=True, text=True, timeout=600)
         except Exception as e:
             log(f"Could not open the push-targets dialog: {e}")
             return
-        if val is None:
-            return                        # cancelled
-        transports.cfg["push_url"] = val.strip()
+        out = proc.stdout or ""
+        if not out.startswith("OK\n"):
+            return                            # cancelled / closed / no input
+        val = out[3:].strip()
+        transports.cfg["push_url"] = val
         save_config(transports.cfg)
-        log(f"Push targets set to: {val.strip() or '(discovery only)'}")
+        log(f"Push targets set to: {val or '(discovery only)'}")
         if transports.active == "push":
-            transports.reselect()         # re-arm push with the new list, live
+            transports.reselect()             # re-arm push with the new list, live
         else:
-            transports.select("push")     # switch to push using the new list
+            transports.select("push")         # switch to push using the new list
 
     def transport_item(name):
         # Radio item: pick how the daemon sends data; switches live + is remembered.
@@ -1040,4 +1101,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # A dialog re-invocation (from the tray's "Configure push targets...") shows the
+    # input window in this fresh process, prints the result, and exits — it must
+    # never fall through to the daemon.
+    if len(sys.argv) >= 2 and sys.argv[1] == DIALOG_FLAG:
+        sys.exit(_run_targets_dialog(sys.argv[2] if len(sys.argv) > 2 else ""))
     main()
