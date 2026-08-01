@@ -46,6 +46,8 @@ import httpx
 
 DEFAULT_POLL_INTERVAL = 60     # seconds between Claude API refreshes
 DEFAULT_PUSH_INTERVAL = 20     # seconds between HTTP pushes to the device
+POLL_RETRY_MIN = 5             # first retry delay after a failed poll
+POLL_RETRY_MAX = 60            # ceiling for the failed-poll backoff
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8787
 
@@ -472,13 +474,13 @@ def poll_api(token: str) -> tuple[dict | None, bool]:
     return payload, False
 
 
-def do_poll() -> None:
-    """One poll cycle: token -> API -> update shared state."""
+def do_poll() -> bool:
+    """One poll cycle: token -> API -> update shared state. True if fresh data landed."""
     token = read_token()
     if not token:
         state.set_status(_auth_hint or "No token - run 'claude setup-token'")
         state.set_payload({"ok": False})
-        return
+        return False
     payload, auth_failed = poll_api(token)
     if auth_failed:
         state.set_status("Refreshing token...")
@@ -492,15 +494,32 @@ def do_poll() -> None:
         state.set_payload(payload)
         state.set_status("Connected")
         log(f"5h={payload['s']}% 7d={payload['w']}% st={payload['st']}")
-    elif "token" not in state.status.lower():
+        return True
+    if "token" not in state.status.lower():
         state.set_status("API error - retrying")
+    return False
 
 
 def poller_loop(interval: float) -> None:
+    """Poll on `interval`, but back off fast->slow while polls are failing.
+
+    Transports only send once a poll has succeeded, so a failed poll leaves the
+    device blank. The common case is login: the LaunchAgent starts us before the
+    network is up, the first call dies on DNS, and a long --interval would strand
+    the display on the logo for minutes. Retry quickly instead, doubling up to
+    POLL_RETRY_MAX so a genuinely dead API is not hammered. A token problem needs
+    the user, so that one waits out the full interval.
+    """
     log(f"Polling Claude every {interval:.0f}s")
+    retry = POLL_RETRY_MIN
     while not state.stop_event.is_set():
-        do_poll()
-        state.refresh_event.wait(interval)
+        if do_poll() or "token" in state.status.lower():
+            wait, retry = interval, POLL_RETRY_MIN
+        else:
+            wait = min(retry, interval)
+            retry = min(retry * 2, POLL_RETRY_MAX)
+            log(f"Poll failed - retrying in {wait:.0f}s")
+        state.refresh_event.wait(wait)
         state.refresh_event.clear()
 
 
