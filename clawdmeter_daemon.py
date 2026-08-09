@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """clawdmeter-daemon — one daemon, three ways to reach the device.
 
-Polls the Claude API rate-limit headers (using the OAuth token Claude Code already
-stores on this machine) and delivers your 5h / 7d usage to a desk device by any of:
+Reads the Claude usage endpoint (using the OAuth token Claude Code already stores
+on this machine) and delivers your 5h / 7d usage to a desk device by any of:
 
   * serial  — write JSON lines over USB CDC (the original Clawdmeter ESP32-S3)
   * push    — HTTP POST to the device   (SmallTV behind Wi-Fi client isolation)
@@ -64,17 +64,16 @@ CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 TOKEN_REFRESH_MARGIN = 300    # refresh 5 min before expiry
 
-API_URL = "https://api.anthropic.com/v1/messages"
+# Dedicated usage endpoint: a plain GET that reports 5h/7d utilization without
+# spending an inference request, so polling it does NOT consume the quota it
+# measures (the previous max_tokens:1 POST to /v1/messages counted against the
+# 5h window on every poll).
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
     "Content-Type": "application/json",
     "User-Agent": "claude-code/2.1.146",
-}
-API_BODY = {
-    "model": "claude-haiku-4-5-20251001",
-    "max_tokens": 1,
-    "messages": [{"role": "user", "content": "hi"}],
 }
 
 
@@ -428,12 +427,34 @@ def read_token() -> str | None:
 
 # ---- API polling ----------------------------------------------------------
 
-def poll_api(token: str) -> tuple[dict | None, bool]:
-    """Minimal API call; extract usage headers. Returns (payload, auth_failed)."""
-    headers = dict(API_HEADERS_TEMPLATE)
-    headers["Authorization"] = f"Bearer {token}"
+def _reset_minutes_from_iso(ts: str, now: float) -> int:
+    """Minutes from now until an ISO-8601 `resets_at` timestamp (0 if past/bad)."""
+    if not ts:
+        return 0
     try:
-        resp = httpx.post(API_URL, headers=headers, json=API_BODY, timeout=20.0)
+        # Python's fromisoformat handles the +07:00 offset the API returns.
+        from datetime import datetime
+        dt = datetime.fromisoformat(ts)
+        mins = (dt.timestamp() - now) / 60.0
+    except (ValueError, TypeError):
+        return 0
+    return int(round(mins)) if mins > 0 else 0
+
+
+def poll_api(token: str) -> tuple[dict | None, bool]:
+    """Read 5h/7d usage from the dedicated usage endpoint. Returns (payload, auth_failed).
+
+    Uses GET /api/oauth/usage — a status query that does NOT consume an inference
+    request, so it doesn't eat the quota it reports. (The previous implementation
+    POSTed a max_tokens:1 message and read rate-limit headers, which counted
+    against the 5h window on every poll.)
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": API_HEADERS_TEMPLATE["User-Agent"],
+    }
+    try:
+        resp = httpx.get(USAGE_URL, headers=headers, timeout=20.0)
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None, False
@@ -443,30 +464,37 @@ def poll_api(token: str) -> tuple[dict | None, bool]:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None, False
 
+    try:
+        data = resp.json()
+    except ValueError as e:
+        log(f"usage parse error: {e}")
+        return None, False
+
     now = time.time()
-
-    def hdr(name, default="0"):
-        return resp.headers.get(name, default)
-
-    def reset_minutes(ts):
-        try:
-            mins = (float(ts) - now) / 60.0
-        except ValueError:
-            return 0
-        return int(round(mins)) if mins > 0 else 0
+    five = data.get("five_hour") or {}
+    seven = data.get("seven_day") or {}
 
     def pct(util):
         try:
-            return int(round(float(util) * 100))
-        except ValueError:
+            # utilization is already 0-100 on this endpoint (not a 0-1 fraction).
+            return int(round(float(util)))
+        except (ValueError, TypeError):
             return 0
 
+    # Prefer the severity from limits[] (kind == session) as the status string;
+    # fall back to "allowed" so the firmware keeps its normal (non-warning) look.
+    status = "allowed"
+    for lim in data.get("limits") or []:
+        if lim.get("kind") == "session" and lim.get("severity"):
+            status = lim["severity"]
+            break
+
     payload = {
-        "s":  pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w":  pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-        "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+        "s":  pct(five.get("utilization")),
+        "sr": _reset_minutes_from_iso(five.get("resets_at", ""), now),
+        "w":  pct(seven.get("utilization")),
+        "wr": _reset_minutes_from_iso(seven.get("resets_at", ""), now),
+        "st": status,
         "ok": True,
     }
     return payload, False
