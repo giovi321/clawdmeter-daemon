@@ -23,9 +23,9 @@ Firmware that speaks the contract:
   * Clawdmeter (ESP32-S3): https://github.com/giovi321/clawdmeter-win
   * SmallTV (ESP8266):     https://github.com/giovi321/smalltv-mod
 
-Payload contract: {"s":29,"sr":142,"w":4,"wr":9876,"st":"allowed","ok":true}
+Payload contract: {"s":29,"sr":142,"w":4,"wr":9876,"st":"normal","ok":true}
   s/w  = 5h / 7d utilization %     sr/wr = minutes until each window resets
-  st   = rate-limit status         ok    = false => no data (e.g. not logged in)
+  st   = session limit severity    ok    = false => no data (e.g. not logged in)
 """
 
 import argparse
