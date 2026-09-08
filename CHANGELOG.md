@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.1.0
+
+Polling no longer spends an inference request, and a failed poll recovers in seconds
+instead of waiting out the interval.
+
+### Changed
+- The poller reads `GET https://api.anthropic.com/api/oauth/usage` instead of POSTing
+  a `max_tokens: 1` message to `/v1/messages` and reading the rate-limit response
+  headers. That POST was a real inference request, so every poll counted against the
+  5-hour window it was measuring (visibly so at short intervals). The usage endpoint
+  is a plain status query, so polling is free and short intervals are safe. Thanks
+  @Piya-Boy (#8).
+- **Breaking for firmware that branches on `st`.** The field now carries the session
+  limit severity (`normal`, `warning`, `rejected`) rather than the rate-limit header
+  status (`allowed`, `allowed_warning`, `rejected`). Use **smalltv-mod 2.13.1+**;
+  older builds read `normal` as a warning and light the accent dot permanently.
+  `clawdmeter-win` stores `st` without branching on it and is unaffected.
+- `utilization` from this endpoint is already 0-100, and `resets_at` is ISO-8601, so
+  the percentage and reset-minute conversions changed accordingly. The payload keys
+  (`s`/`sr`/`w`/`wr`/`st`/`ok`) are unchanged.
+
+### Fixed
+- A failed poll now retries with a fast backoff (5s, 10s, 20s, 40s, capped at 60s and
+  never above `--interval`) and resets to the normal interval on the first success.
+  Transports only send once a poll has succeeded, so with a long `--interval` a
+  first-poll failure at login (autostart racing the network, DNS not up yet) left the
+  device on its logo for minutes. A missing or invalid token still waits the full
+  interval, since that needs the user. Thanks @eakarin (#7).
+
 ## v1.0.2
 
 Keep the tray menu compact when pushing to several devices.

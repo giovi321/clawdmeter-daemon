@@ -1,8 +1,8 @@
 # clawdmeter-daemon
 
-One small daemon that shows your **Claude Code usage** on a desk device. It polls
-the Claude API rate-limit headers (using the OAuth token Claude Code already stores
-on your machine) and delivers your **5-hour** and **7-day** usage to the device by
+One small daemon that shows your **Claude Code usage** on a desk device. It reads the
+Claude usage endpoint (using the OAuth token Claude Code already stores on your
+machine) and delivers your **5-hour** and **7-day** usage to the device by
 whichever transport fits your setup:
 
 | Transport | How | For |
@@ -17,8 +17,9 @@ This merges the two device-specific daemons into one:
 - **Clawdmeter (ESP32‑S3, serial):** https://github.com/giovi321/clawdmeter-win
 - **SmallTV (ESP8266, HTTP):** https://github.com/giovi321/smalltv-mod
 
-> Not affiliated with Anthropic. The throwaway API call it makes (cheapest model,
-> `max_tokens: 1`) is only to read the rate-limit response headers.
+> Not affiliated with Anthropic. It reads `GET /api/oauth/usage`, a plain status
+> query, so a poll spends no inference request and does not consume the quota it
+> reports. Short intervals are safe.
 
 ## Install
 
@@ -149,20 +150,25 @@ look if a windowless/headless launch seems to do nothing.
 Every transport delivers the same object:
 
 ```json
-{ "s": 29, "sr": 142, "w": 4, "wr": 9876, "st": "allowed", "ok": true }
+{ "s": 29, "sr": 142, "w": 4, "wr": 9876, "st": "normal", "ok": true }
 ```
 
 | field | meaning |
 |-------|---------|
 | `s` / `w` | 5‑hour / 7‑day window utilization (%) |
 | `sr` / `wr` | minutes until each window resets |
-| `st` | rate-limit status (`allowed`, `allowed_warning`, `rejected`, …) |
+| `st` | session limit severity (`normal`, `warning`, `rejected`, …) |
 | `ok` | `false` when there's no data (e.g. not logged in) |
 
 - **serial:** one JSON line per update; reads `{"ready"}` / `{"refresh"}` back from
   the device to re-poll. `--no-hid` sends `{"hid":false}` on connect.
 - **push:** `POST` to `http://<device>/api/usage`.
 - **serve:** `GET http://host:port/` returns the latest object (`/healthz` too).
+
+> `st` changed vocabulary in v1.1.0, when the daemon moved to the usage endpoint. It
+> used to carry the rate-limit header status (`allowed`, `allowed_warning`,
+> `rejected`). Firmware that branches on the exact string wants **smalltv-mod
+> 2.13.1+**; older builds read `normal` as a warning and light the accent dot.
 
 ## Options
 
