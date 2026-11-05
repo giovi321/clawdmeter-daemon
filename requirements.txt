@@ -8,7 +8,7 @@ pystray==0.19.5
 Pillow==13.0.0
 # mDNS auto-discovery for --push (find every SmallTV on the LAN). Optional:
 # push still works with explicit --push-to hosts if this isn't installed.
-zeroconf==0.150.0
+zeroconf==0.151.5
 # macOS tray backend: pystray drives the menu bar via AppKit (pyobjc).
 # Auto-installed only on macOS thanks to the environment marker.
 pyobjc-framework-Cocoa==12.2.2; sys_platform == "darwin"
