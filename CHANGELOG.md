@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v1.2.0
+
+Claude Code prompt status on smalltv-mod 3.4.0 and later. Needs Python 3.11+.
 
 ### Changed
 - Needs Python 3.11 or later. Python 3.10 reached end of life in October 2026,
@@ -14,7 +16,7 @@
   every other setting; `--uninstall-hooks` removes them. The hooks call the daemon on
   `127.0.0.1:8788` (`--activity-port`). The daemon forwards `running` / `done` to
   every device it pushes to, at `POST /api/activity?state=...`, which needs
-  smalltv-mod with that endpoint. A device web UI password goes in
+  smalltv-mod 3.4.0 or later. A device web UI password goes in
   `~/.clawdmeter-daemon.json` as `device_user` / `device_password`.
 
 ## v1.1.0
