@@ -23,7 +23,7 @@ This merges the two device-specific daemons into one:
 
 ## Install
 
-Needs Python 3.10+. Works on Windows, macOS and Linux.
+Needs Python 3.11+. Works on Windows, macOS and Linux.
 
 ```sh
 pip install -r requirements.txt

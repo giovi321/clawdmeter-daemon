@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+- Needs Python 3.11 or later. Python 3.10 reached end of life in October 2026,
+  and the current Pillow, zeroconf and pyobjc releases need 3.11.
+- The dependencies in `requirements.txt` are pinned to exact versions, and
+  Dependabot proposes newer ones once they are two weeks old.
+
 ### Added
 - Claude Code prompt status on the device. `--install-hooks` adds a
   `UserPromptSubmit` hook and a `Stop` hook to `~/.claude/settings.json`, keeping
