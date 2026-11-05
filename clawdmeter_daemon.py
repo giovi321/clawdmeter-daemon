@@ -18,6 +18,7 @@ Cross-platform: Windows, macOS and Linux (tray + login autostart on each).
     python clawdmeter_daemon.py --serve --port 8787       # serve for the device to pull
     python clawdmeter_daemon.py --serial --serve          # several at once
     python clawdmeter_daemon.py --install                 # start at login (per-user, this OS)
+    python clawdmeter_daemon.py --install-hooks           # show Claude Code prompt status on the device
 
 Firmware that speaks the contract:
   * Clawdmeter (ESP32-S3): https://github.com/giovi321/clawdmeter-win
@@ -31,6 +32,7 @@ Payload contract: {"s":29,"sr":142,"w":4,"wr":9876,"st":"normal","ok":true}
 import argparse
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -50,6 +52,7 @@ POLL_RETRY_MIN = 5             # first retry delay after a failed poll
 POLL_RETRY_MAX = 60            # ceiling for the failed-poll backoff
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8787
+DEFAULT_ACTIVITY_PORT = 8788   # localhost-only listener for the Claude Code hooks
 
 # Internal argv flag: re-invoke ourselves to show the push-targets input dialog in
 # its own process (so Tk runs on a real main thread and accepts keyboard input).
@@ -134,6 +137,11 @@ def load_config() -> dict:
         "serve_port": DEFAULT_PORT,
         "serial_port": None,      # None => auto-detect
         "push_interval": DEFAULT_PUSH_INTERVAL,
+        "activity_port": DEFAULT_ACTIVITY_PORT,
+        # Only needed when the device's web UI password is on: /api/activity sits
+        # behind it (unlike /api/usage). Kept here, not in Claude's settings.json.
+        "device_user": "admin",
+        "device_password": "",
     }
     try:
         cfg.update(json.loads(CONFIG_PATH.read_text()))
@@ -814,6 +822,120 @@ def push_loop(stop: threading.Event, targets_fn, interval: float) -> None:
         stop.wait(interval)
 
 
+# ---- Claude Code prompt activity (hooks -> daemon -> devices) -------------
+# Claude Code hooks report when a prompt starts (UserPromptSubmit) and finishes
+# (Stop). They call this daemon on localhost, and the daemon forwards the state
+# to the devices it pushes to: POST /api/activity?state=running|done|idle
+# (smalltv-mod). So the hooks need no device address, and a device web UI
+# password stays in the daemon config instead of in Claude's settings.json.
+
+ACTIVITY_PATH = "/clawdmeter-activity"     # also marks our hooks in settings.json
+ACTIVITY_STATES = ("running", "done", "idle")
+
+
+def _activity_url(push_url: str, act: str) -> str:
+    """http://dev/api/usage -> http://dev/api/activity?state=<act>"""
+    m = re.match(r"(https?://[^/]+)", push_url)
+    base = m.group(1) if m else push_url.rstrip("/")
+    return f"{base}/api/activity?state={act}"
+
+
+class _ActivityHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        from urllib.parse import parse_qs, urlsplit
+        u = urlsplit(self.path)
+        act = (parse_qs(u.query).get("state") or [""])[0]
+        if u.path.rstrip("/") != ACTIVITY_PATH:
+            code = 404
+        elif act not in ACTIVITY_STATES:
+            code = 400
+        else:
+            code = 204          # no body, so the hook's curl prints nothing
+            self.server.relay.submit(act)
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class ActivityRelay:
+    """Localhost listener for the hooks plus one worker that forwards to devices.
+
+    One worker, so states reach a device in the order they happened (a short
+    prompt sends running and done within milliseconds; two racing threads could
+    deliver done first and leave the device on running). If several states queue
+    up while a device is slow, only the newest is sent.
+    """
+
+    def __init__(self, transports: "Transports", port: int):
+        self.transports = transports
+        self.port = port
+        self._q: queue.Queue = queue.Queue()
+        self._server = None
+
+    def start(self) -> bool:
+        try:
+            self._server = ThreadingHTTPServer(("127.0.0.1", self.port), _ActivityHandler)
+        except OSError as e:
+            log(f"Claude Code activity relay off: cannot listen on 127.0.0.1:{self.port} ({e})")
+            return False
+        self._server.relay = self
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        threading.Thread(target=self._worker, daemon=True).start()
+        log(f"Claude Code activity relay on http://127.0.0.1:{self.port}{ACTIVITY_PATH}")
+        return True
+
+    def submit(self, act: str) -> None:
+        self._q.put(act)
+
+    def _worker(self) -> None:
+        while not state.stop_event.is_set():
+            try:
+                act = self._q.get(timeout=1)
+            except queue.Empty:
+                continue
+            while True:                     # keep only the newest queued state
+                try:
+                    act = self._q.get_nowait()
+                except queue.Empty:
+                    break
+            self._forward(act)
+
+    def _forward(self, act: str) -> None:
+        urls = self.transports.push_urls()
+        if not urls:
+            log(f"Activity {act}: no device to send it to (needs the HTTP push transport)")
+            return
+        cfg = self.transports.cfg
+        pw = cfg.get("device_password") or ""
+        auth = httpx.DigestAuth(cfg.get("device_user") or "admin", pw) if pw else None
+        for url in urls:
+            target = _activity_url(url, act)
+            try:
+                r = httpx.post(target, auth=auth, timeout=3.0)
+            except httpx.HTTPError as e:
+                log(f"Activity {act} -> {target} failed: {e}")
+                continue
+            if r.status_code == 401:
+                log(f"Activity {act} -> {target}: HTTP 401 - the device has a web UI "
+                    f"password; set device_user / device_password in {CONFIG_PATH}")
+            elif r.status_code == 404:
+                log(f"Activity {act} -> {target}: HTTP 404 - firmware without /api/activity")
+            elif r.status_code >= 400:
+                log(f"Activity {act} -> {target}: HTTP {r.status_code}")
+
+    def stop(self) -> None:
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:
+                pass
+            self._server = None
+
+
 # ---- Transport supervisor (runtime switch from the tray) ------------------
 
 class Transports:
@@ -831,6 +953,12 @@ class Transports:
         self._stop = None        # per-transport stop event for the running thread
         self._server = None      # ThreadingHTTPServer while serving
         self._discovery = None   # mDNS Discovery while pushing
+        self._targets = None     # live push-URL list while pushing (for the activity relay)
+
+    def push_urls(self) -> list:
+        """The devices currently pushed to; empty unless the push transport is on."""
+        fn = self._targets
+        return fn() if fn else []
 
     def select(self, name: str) -> None:
         if name not in self.NAMES:
@@ -866,6 +994,7 @@ class Transports:
                                 if u not in urls:
                                     urls.append(u)
                         return urls
+                    self._targets = targets
                     threading.Thread(
                         target=push_loop,
                         args=(stop, targets,
@@ -898,6 +1027,7 @@ class Transports:
         if self._discovery is not None:
             self._discovery.stop()
             self._discovery = None
+        self._targets = None
         state.endpoint = ""
         state.push_target = ""
         with state.lock:
@@ -1377,6 +1507,104 @@ def autostart_status() -> str | None:
         sys.platform, _linux_autostart_status)()
 
 
+# ---- Claude Code hooks (--install-hooks / --uninstall-hooks) --------------
+# Merges two hooks into ~/.claude/settings.json that report prompt activity to
+# the relay above, and removes them again. Every other setting, and any hook of
+# your own on the same events, is kept. Our hooks are recognised by
+# ACTIVITY_PATH in their command, so a re-install replaces them instead of
+# adding a second copy.
+
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+HOOK_EVENTS = (("UserPromptSubmit", "running"), ("Stop", "done"))
+
+
+def _hook_command(port: int, act: str) -> str:
+    # async in the hook entry + a short timeout: a prompt never waits on this.
+    # `|| true` keeps a stopped daemon from showing up as a hook error.
+    return (f'curl -s -m 2 -X POST "http://127.0.0.1:{port}{ACTIVITY_PATH}?state={act}" '
+            f'>/dev/null 2>&1 || true')
+
+
+def _load_claude_settings() -> dict:
+    if not CLAUDE_SETTINGS_PATH.exists():
+        return {}
+    data = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("the top level is not a JSON object")
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict) or any(not isinstance(v, list) for v in hooks.values()):
+        raise ValueError("'hooks' does not have the expected {event: [...]} shape")
+    return data
+
+
+def _write_claude_settings(data: dict) -> None:
+    CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLAUDE_SETTINGS_PATH.with_name(CLAUDE_SETTINGS_PATH.name + ".clawdmeter.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(CLAUDE_SETTINGS_PATH)
+
+
+def _strip_our_hooks(data: dict) -> int:
+    """Remove our hook entries; drop matcher groups and events left empty."""
+    hooks = data.get("hooks")
+    if not hooks:
+        return 0
+    removed = 0
+    for event in list(hooks):
+        groups = []
+        for g in hooks[event]:
+            inner = g.get("hooks") if isinstance(g, dict) else None
+            if isinstance(inner, list):
+                keep = [h for h in inner
+                        if not (isinstance(h, dict) and ACTIVITY_PATH in str(h.get("command", "")))]
+                removed += len(inner) - len(keep)
+                if not keep:
+                    continue
+                g = {**g, "hooks": keep}
+            groups.append(g)
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
+    if not hooks:
+        del data["hooks"]
+    return removed
+
+
+def hooks_install(port: int) -> str:
+    try:
+        data = _load_claude_settings()
+    except (OSError, ValueError) as e:
+        return f"Not changed: could not read {CLAUDE_SETTINGS_PATH}: {e}"
+    _strip_our_hooks(data)
+    hooks = data.setdefault("hooks", {})
+    for event, act in HOOK_EVENTS:
+        hooks.setdefault(event, []).append(
+            {"hooks": [{"type": "command", "command": _hook_command(port, act), "async": True}]})
+    try:
+        _write_claude_settings(data)
+    except OSError as e:
+        return f"Not changed: could not write {CLAUDE_SETTINGS_PATH}: {e}"
+    return (f"Claude Code hooks on: UserPromptSubmit and Stop in {CLAUDE_SETTINGS_PATH}\n"
+            f"They report to this daemon on 127.0.0.1:{port}, which forwards to the devices "
+            f"it pushes to.\nOpen a new Claude Code session to load them.")
+
+
+def hooks_uninstall() -> str:
+    try:
+        data = _load_claude_settings()
+    except (OSError, ValueError) as e:
+        return f"Not changed: could not read {CLAUDE_SETTINGS_PATH}: {e}"
+    removed = _strip_our_hooks(data)
+    if not removed:
+        return "Claude Code hooks were not installed (nothing to remove)"
+    try:
+        _write_claude_settings(data)
+    except OSError as e:
+        return f"Not changed: could not write {CLAUDE_SETTINGS_PATH}: {e}"
+    return f"Claude Code hooks off: removed {removed} from {CLAUDE_SETTINGS_PATH}"
+
+
 # ---- Entry point ----------------------------------------------------------
 
 def main() -> None:
@@ -1406,7 +1634,25 @@ def main() -> None:
                     help="remove the autostart entry and exit")
     ap.add_argument("--autostart-status", action="store_true",
                     help="print whether autostart is registered and exit")
+    # Claude Code prompt status on the device (smalltv-mod /api/activity).
+    ap.add_argument("--install-hooks", action="store_true",
+                    help="add the prompt-status hooks to ~/.claude/settings.json and exit")
+    ap.add_argument("--uninstall-hooks", action="store_true",
+                    help="remove those hooks again and exit")
+    ap.add_argument("--activity-port", type=int, default=None,
+                    help=f"localhost port the hooks report to (default {DEFAULT_ACTIVITY_PORT})")
     args = ap.parse_args()
+
+    if args.install_hooks or args.uninstall_hooks:
+        if args.uninstall_hooks:
+            print(hooks_uninstall())
+            return
+        cfg = load_config()
+        if args.activity_port is not None:
+            cfg["activity_port"] = args.activity_port
+            save_config(cfg)
+        print(hooks_install(int(cfg.get("activity_port", DEFAULT_ACTIVITY_PORT))))
+        return
 
     # Autostart management runs and exits; it never starts the daemon.
     if args.install:
@@ -1446,6 +1692,8 @@ def main() -> None:
         cfg["serve_port"] = args.port
     if args.push_interval is not None:
         cfg["push_interval"] = args.push_interval
+    if args.activity_port is not None:
+        cfg["activity_port"] = args.activity_port
 
     # Initial transport: a CLI flag wins, else the remembered choice, else a sensible
     # default — push if a target is configured (env/config), otherwise serve.
@@ -1458,6 +1706,8 @@ def main() -> None:
     transports = Transports(cfg)
     transports.select(initial)
     log(f"clawdmeter-daemon: transport = {initial}  (switch from the tray menu)")
+    relay = ActivityRelay(transports, int(cfg.get("activity_port", DEFAULT_ACTIVITY_PORT)))
+    relay.start()
 
     use_tray = not args.no_tray
     if use_tray and not tray_backend_available():
@@ -1480,6 +1730,7 @@ def main() -> None:
             run_console()
     else:
         run_console()
+    relay.stop()
     transports.shutdown()
     log("Stopped")
 

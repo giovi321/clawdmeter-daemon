@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Claude Code prompt status on the device. `--install-hooks` adds a
+  `UserPromptSubmit` hook and a `Stop` hook to `~/.claude/settings.json`, keeping
+  every other setting; `--uninstall-hooks` removes them. The hooks call the daemon on
+  `127.0.0.1:8788` (`--activity-port`). The daemon forwards `running` / `done` to
+  every device it pushes to, at `POST /api/activity?state=...`, which needs
+  smalltv-mod with that endpoint. A device web UI password goes in
+  `~/.clawdmeter-daemon.json` as `device_user` / `device_password`.
+
 ## v1.1.0
 
 Polling no longer spends an inference request, and a failed poll recovers in seconds

@@ -145,6 +145,35 @@ Convenience scripts wrap dependency install + `--install`:
 Anything the daemon logs also goes to **`~/.clawdmeter-daemon.log`** — the place to
 look if a windowless/headless launch seems to do nothing.
 
+## Prompt status from Claude Code (SmallTV)
+
+With **smalltv-mod** firmware that has `/api/activity`, the Clawdmeter screen also
+shows whether Claude Code is working right now. While a prompt runs, three orange
+dots hop in the top-right corner. When it finishes, the panel flashes orange with
+`DONE`, and a small `DONE` badge stays in the corner.
+
+Claude Code reports this through two hooks. One command adds them:
+
+```sh
+python clawdmeter_daemon.py --install-hooks     # add the hooks to ~/.claude/settings.json
+python clawdmeter_daemon.py --uninstall-hooks   # remove them again
+```
+
+- `--install-hooks` merges a `UserPromptSubmit` hook and a `Stop` hook into
+  `~/.claude/settings.json`. Every other setting is kept, including hooks of your own
+  on the same events. Running it again replaces the hooks instead of adding a second
+  copy. Open a new Claude Code session afterwards so it loads them.
+- The hooks only call the daemon on `127.0.0.1:8788` (`--activity-port`). The daemon
+  forwards the state to every device it pushes to, the `--push-to` hosts and the ones
+  mDNS found. So the hooks need no device address, and it works for several devices.
+- This needs the **HTTP push** transport, and the daemon has to be running. If the
+  daemon is down, the hooks do nothing and a prompt never waits on them.
+- The hooks use `curl`. It ships with Windows 10 and later, macOS and most Linux
+  distributions.
+- If the device's web UI password is on, `/api/activity` needs it, unlike
+  `/api/usage`. Put it in `~/.clawdmeter-daemon.json` as `"device_user"` (default
+  `admin`) and `"device_password"`. It stays there, not in Claude's settings.
+
 ## The payload contract
 
 Every transport delivers the same object:
@@ -189,6 +218,9 @@ Every transport delivers the same object:
 --install           register autostart at login (per-user) and exit
 --uninstall         remove the autostart entry and exit
 --autostart-status  print whether autostart is registered and exit
+--install-hooks     add the Claude Code prompt-status hooks to ~/.claude/settings.json
+--uninstall-hooks   remove them again
+--activity-port N   localhost port the hooks report to (default 8788)
 ```
 
 ## Troubleshooting
